@@ -712,3 +712,36 @@ porque el seed viejo aún estaba desplegado.
 **Nota:** el fix del seed hay que **desplegarlo** (push + redeploy) para que el
 flujo `npm run seed` quede disponible; el `UPDATE` manual ya dejó el bot operativo
 sin esperar al deploy.
+
+## Sesión 10 — Resiliencia del arranque: `bot.launch()` con reintento (Railway)
+
+**Incidente/diagnóstico:** el botón de "borrar base de datos" fallaba en Railway
+("oprimo confirmar y no pasa nada"), mientras Entré/Salí funcionaban siempre.
+Auditoría del estado en memoria: TODAS las confirmaciones de dos pasos
+(`resetPendientes`, `movimientosPendientes`, `ratesPendientes`, `propuestas`,
+`awaitingAdmin`, `novedades`, `solicitudesFallback`/`Tipo`) viven en RAM del
+proceso. Los flujos cuyo botón lleva un **id de la DB** (aprobar corrección
+`ap:confirm`, cerrar quincena `cierre:confirm`, elegir turno `ct:pick`) sobreviven
+un reinicio; los que llevan un **token en RAM** se pierden si el proceso se
+reinicia entre los dos pasos. Entré/Salí son stateless (DB directa) → nunca fallan.
+
+**Causa de los reinicios:** `bot.launch().catch(() => process.exit(1))` mataba el
+proceso ante CUALQUIER rechazo. Confirmado en la fuente de Telegraf 4.16.3
+([polling.js]): los errores de red/429/5xx se reintentan internamente; `launch()`
+solo rechaza ante **409 Conflict** (otro `getUpdates` activo — típico cuando un
+redeploy se solapa con la instancia anterior, transitorio) o **401** (token malo).
+El `exit(1)` ante un 409 transitorio reiniciaba el proceso (perdiendo toda la RAM)
+y podía entrar en bucle de crashes.
+
+**Fix (solo `index.ts`, sin lógica de negocio):** `arrancarBotConReintento()` —
+reintenta `bot.launch()` EN el mismo proceso con backoff exponencial (1→2→4→8→16→30s,
+con tope), preservando el estado en memoria. El 401 sí es fatal (sale con log
+claro; es config errónea). `bot.stop()` marca `deteniendo` para no re-lanzar durante
+el apagado. Re-lanzar es seguro: Telegraf crea un `Polling` nuevo cada vez.
+Validado con simulación del bucle (409×2→arranca; 401→exit; backoff correcto).
+Reduce drásticamente la ventana de pérdida de estado para TODOS los flujos de
+confirmación de golpe.
+
+**Pendiente (fix de fondo, no hecho):** persistir las confirmaciones pendientes
+(tabla / TTL) para que sobrevivan también a un redeploy real a mitad de un flujo;
+y confirmar **Scale = 1 instancia** en Railway (2 réplicas → 409 permanente).

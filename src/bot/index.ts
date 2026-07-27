@@ -1476,13 +1476,51 @@ process.on('unhandledRejection', (reason) => {
   console.error('unhandledRejection:', reason);
 });
 
-// ---------- Arranque ----------
-bot.launch({ dropPendingUpdates: true }).catch((err) => {
-  console.error('Fallo al arrancar el bot:', err);
-  process.exit(1);
-});
-iniciarScheduler((quincenaId) => ejecutarCierreYenviar(quincenaId, { auto: true }));
-console.log('🤖 Bot arrancado (long polling). Ctrl+C para detener.');
+// ---------- Arranque con reintento (resiliencia en Railway) ----------
+// Telegraf ya reintenta internamente los errores de red / 429 / 5xx. `bot.launch()`
+// solo RECHAZA ante 409 (otro getUpdates activo — típico cuando un redeploy se
+// solapa con la instancia anterior) o 401 (token inválido). Antes hacíamos
+// process.exit(1) ante cualquier rechazo: en un 409 transitorio eso reiniciaba el
+// proceso —perdiendo todo el estado en memoria (confirmaciones pendientes, etc.)—
+// y podía entrar en bucle de crashes. Ahora reintentamos EN el mismo proceso,
+// preservando el estado; solo el 401 (config errónea) se considera fatal.
+let deteniendo = false;
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+const codigoError = (e: unknown): number | undefined => {
+  const o = e as { code?: number; response?: { error_code?: number } } | null | undefined;
+  return o?.code ?? o?.response?.error_code;
+};
+
+async function arrancarBotConReintento(): Promise<void> {
+  for (let intento = 1; !deteniendo; intento++) {
+    try {
+      await bot.launch({ dropPendingUpdates: true });
+      return; // resolvió = el bot se detuvo de forma limpia (SIGINT/SIGTERM)
+    } catch (err) {
+      if (deteniendo) return;
+      if (codigoError(err) === 401) {
+        console.error('✖ Token de Telegram inválido (401): revisa TELEGRAM_BOT_TOKEN. No reintento.', err);
+        process.exit(1);
+      }
+      const espera = Math.min(30_000, 1_000 * 2 ** Math.min(intento - 1, 5));
+      const motivo = codigoError(err) === 409 ? '409 Conflict (otra instancia haciendo polling)' : 'error de arranque/polling';
+      console.error(`⚠️  Bot caído por ${motivo} (intento ${intento}). Reintento en ${Math.round(espera / 1000)}s.`, err);
+      await new Promise((r) => setTimeout(r, espera));
+    }
+  }
+}
+
+void arrancarBotConReintento();
+iniciarScheduler((quincenaId) => ejecutarCierreYenviar(quincenaId, { auto: true }));
+console.log('🤖 Bot arrancado (long polling con reintento). Ctrl+C para detener.');
+
+const apagar = (sig: 'SIGINT' | 'SIGTERM') => {
+  deteniendo = true;
+  try {
+    bot.stop(sig);
+  } catch {
+    /* no estaba lanzado en ese instante — nada que detener */
+  }
+};
+process.once('SIGINT', () => apagar('SIGINT'));
+process.once('SIGTERM', () => apagar('SIGTERM'));
