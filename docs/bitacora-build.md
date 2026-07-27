@@ -46,3 +46,453 @@ Formato sugerido por entrada:
   cae en un turno partido (mañana/tarde).
 - Definir qué pasa si una empleada marca "Entré" dos veces sin salida
   intermedia.
+
+---
+
+## Sesión 1 — Flujo de marcación + correcciones de punta a punta (secciones 4-7)
+
+**Construido:**
+- Setup del proyecto: `package.json`, `tsconfig.json`, estructura
+  `/src/{bot,core,db,jobs,reports}`. Stack: Node 26 + TypeScript corrido con
+  `tsx` (imports con extensión `.ts`, ESM). `jobs/` y `reports/` quedan
+  creadas pero vacías (son de sesiones futuras).
+- Schema PostgreSQL (`src/db/schema.sql`) + migración idempotente
+  (`src/db/migrate.ts`): `empleadas`, `admins`, `config_rates`,
+  `eventos_marcacion` (inmutable), `turnos` (derivada), `festivos`, y
+  `quincenas` (mínima). Enums `evento_tipo`, `evento_estado`,
+  `quincena_estado`. Índices para bloques y turnos. Sin `UNIQUE(empleada_id,
+  fecha)` en `turnos` — los turnos partidos están soportados por diseño.
+- Seed (`src/db/seed.ts`), idempotente: `config_rates` con SMMLV, recargos,
+  divisor 210 e inicio nocturno 19:00; Nena y Maye con sus `chat_id_grupo`
+  reales; Nico y Nati en `admins`; los 18 festivos colombianos de 2026 (Ley
+  Emiliani aplicada).
+- Motor de clasificación (`src/core/clasificador.ts`) como funciones PURAS,
+  probado sin bot ni DB. Convención de tiempo Bogotá en `src/core/tiempo.ts`.
+  8 tests (`clasificador.test.ts`): ordinaria, extra diurna, extra nocturna,
+  cruce del corte 19:00, dominical/festivo, fracciones, turno partido, y
+  guardas de error.
+- `interpretarCorreccion()` (`src/core/interpretarCorreccion.ts`), Nivel 1 por
+  patrones simples, detrás de UNA sola función (swappable por LLM sin tocar el
+  resto). 10 tests, incluyendo casos de fallback y no-confundir-duración.
+- Bot Telegraf (`src/bot/`): panel con botones Entré/Salí, flujo de marcación
+  (entrada directa, doble "Entré" = corrección, "Salí" cierra bloque y
+  materializa turno, turnos partidos), corrección en lenguaje natural (Nivel 1
+  + fallback manual a admins), y aprobación en el grupo de admins con
+  Confirmar / Ajustar hora. Capa de orquestación en `src/bot/servicio.ts` y
+  formateo con separación estricta de audiencias en `src/bot/formato.ts`
+  (empleadas: solo horas; admins: con pesos).
+- Validación: 18 tests unitarios de `/core` en verde + un smoke test de
+  integración contra el Postgres real que ejercitó los 5 escenarios
+  requeridos (turno normal con extra, turno partido, doble-Entré→corrección,
+  corrección NL interpretada, y fallback→admin escribe la hora) — todos
+  pasaron y los montos cuadran (SMMLV/210 = $6.778,57/h). El bot arranca en
+  long polling y es miembro (verificado con `getChat`) de los 3 grupos reales
+  ADMIN/NENA/MAYE con permiso de envío. Falta solo el tap-through en vivo, que
+  hace Pablo en el demo.
+
+**Decisiones tomadas:**
+- **Zona horaria:** Bogotá es UTC-5 sin horario de verano. Se codifica la hora
+  de pared de Bogotá en los *campos UTC* de los `Date` (`tiempo.ts`), para que
+  el motor puro sea determinista sin depender de la TZ del proceso ni de
+  `Intl`. Los `timestamp` de Postgres se guardan/parsean como texto en esa
+  convención (se desactivó el parseo automático de `date`/`timestamp` en el
+  pool).
+- **`quincenas` mínima:** se creó la tabla (aunque el cierre es de otra sesión)
+  porque `turnos.quincena_id` la referencia y la sección 6.3 exige asociar
+  cada turno a la quincena vigente. Helper `ensureQuincenaVigente(fecha)`
+  deriva Q1 (1-15) / Q2 (16-fin) y el nombre del periodo a partir de reglas ya
+  documentadas (Glosario + sección 12). No inventa lógica de negocio nueva.
+- **Ciclo de vida de eventos vs. inmutabilidad:** transicionar el `estado` de
+  un evento (`pendiente`→`confirmado`/`rechazado`) SÍ se hace en la misma fila
+  — es el ciclo de aprobación que la sección 7.4 describe explícitamente. La
+  inmutabilidad de la sección 3 se respeta así: nunca se edita
+  `momento_declarado`/`tipo`; una corrección de la *hora* es siempre una fila
+  nueva (`ajustarHoraEvento`: el pendiente pasa a `rechazado` y nace un evento
+  confirmado encadenado por `corrige_evento_id`).
+- **Bloque abierto:** definido como entrada `confirmado` que (a) no fue
+  consumida por ningún turno y (b) no fue superada por una corrección
+  confirmada. Con eso el invariante de "máximo un bloque abierto" se cumple
+  incluso con el doble-Entré (la corrección pendiente no supera hasta que se
+  aprueba).
+- **`config_rates.vigente_desde` = 2026-01-01** (no 2026-08-01) para que el
+  motor tenga rates disponibles en el demo de hoy (2026-07-21). El "arranque en
+  cero el 1-ago" es sobre cuándo se empiezan a contar horas, no sobre desde
+  cuándo existen los rates.
+- **`interpretarCorreccion` — heurística AM/PM:** sin meridiem explícito, horas
+  1-6 se asumen PM (tarde), 7-11 AM, 12 mediodía. Un número suelto no se toma
+  si va seguido de "horas/min" (evita leer "trabajé 5 horas" como una hora).
+
+**Bugs encontrados y cómo se resolvieron:**
+- El seed ponía `config_rates.vigente_desde = 2026-08-01`, así que el motor no
+  encontraba rates para hoy (2026-07-21) y el smoke fallaba con "No hay
+  config_rates vigente". Se cambió a 2026-01-01 (ver decisión arriba).
+- `tsc` fallaba por importar con extensión `.ts`: se agregó
+  `allowImportingTsExtensions: true` al `tsconfig` (compatible con `noEmit`).
+- `DesgloseTramos` no era asignable a `Record<string, number>` (falta index
+  signature) en `crearTurno`: se tipó el parámetro con `DesgloseTramos`.
+- `tsx -e` con top-level await falla (salida CJS); para el reset puntual de la
+  DB se usó `docker exec ... psql` en su lugar (no afecta el código).
+
+**Preguntas abiertas / pendiente para la próxima sesión:**
+
+*Valores de negocio a confirmar con Pablo (sembrados con placeholders razonables,
+editables sin tocar código porque son filas de `config_rates`):*
+- **SMMLV 2026 exacto:** se sembró $1.423.500 (valor 2025 confirmado) como
+  placeholder. Actualizar al decreto 2026 cuando se confirme.
+- **`rec_extra_nocturna` y `rec_dominical`:** el documento técnico solo fija
+  numéricamente `rec_extra_diurna = 0.25`. Se sembraron ambas en 0.75
+  (aproximación estándar colombiana). Confirmar.
+- **Umbral de jornada ordinaria diaria:** el doc fija el divisor mensual (210)
+  pero no el umbral diario a partir del cual una hora del turno es "extra". Se
+  implementó como `divisor_horas / 30` (= 7 h/día con 210), transparente y
+  editable. Confirmar que es la intención.
+- **`config_rates.salario_base` vs. `empleadas.salario_base_mensual`:** ambos
+  existen. El motor usa `config_rates.salario_base` (sección 5). Hoy coinciden
+  (ambas al mínimo). Definir cuál manda si en el futuro difieren por empleada.
+
+*Limitaciones conocidas (no bugs, decisiones acotadas):*
+- **Turnos que cruzan medianoche / fin del tramo nocturno:** `config_rates`
+  tiene `inicio_nocturno` (19:00) pero no fin (ej. 06:00). Un minuto con hora de
+  reloj ≥ 19:00 es nocturno; 00:00-19:00 es diurno. Turnos que cruzan
+  medianoche clasifican la madrugada como diurna. Aceptable para el alcance
+  actual; revisar si aparecen turnos nocturnos reales.
+- **Turno partido y jornada ordinaria:** la clasificación es por turno, no por
+  día, así que cada bloque recibe su propia asignación de 7h ordinarias. Un día
+  con dos bloques cortos podría sumar más "ordinarias" que un día completo.
+  Baja frecuencia; revisar en el cierre de quincena si hace ruido.
+- **Fallback de corrección sin hora:** las solicitudes que caen al fallback
+  (Nivel 1 no interpreta) se guardan en MEMORIA hasta que el admin escribe la
+  hora. Un reinicio del proceso las pierde. Mejora futura: tabla
+  `solicitudes_correccion` para persistirlas (también ayudaría a la regla de
+  sección 7.5 de que un pendiente bloquea el cierre).
+
+*Funcionalidad pendiente (fuera del alcance de esta sesión, por diseño):*
+- Actividades extra (Rococó/Gatas), préstamos, bonos, consulta en vivo.
+- Cierre de quincena automático + generación de Excel/PDF (job en `/src/jobs`,
+  reportes en `/src/reports`).
+- Integración opcional con LLM externo para subir el % de interpretación del
+  Nivel 1 (solo si la evidencia real muestra muchos fallbacks).
+
+---
+
+## Sesión 2 — Actividades extra, préstamos/bonos y consulta en vivo (secciones 8-11)
+
+**Construido:**
+- Schema Fase 2 (idempotente, en `schema.sql`): tablas `catalogo_actividades`,
+  `actividades`, `movimientos` + enum `movimiento_tipo` (`prestamo`/`bono`) +
+  columna nueva `turnos.valor_tramos jsonb` (`ALTER TABLE ... ADD COLUMN IF NOT
+  EXISTS`). Índices por quincena.
+- Seed: `catalogo_actividades` con Rococó y Gatas a $10.000 c/u (editables).
+- Core (funciones puras + tests, ahora 32 en total):
+  - `src/core/comandosAdmin.ts`: `interpretarComandoAdmin()` + `parseMonto()`
+    (préstamo/bono/consulta), detrás de una sola función como
+    `interpretarCorreccion` — swappable por LLM. 11 tests.
+  - `src/core/quincena.ts`: `valorExtrasDe`, `salarioBaseQuincena`,
+    `calcularNetoPreliminar`. 3 tests.
+- Persistencia de `valor_tramos` en cada turno (del motor
+  `detalle.valorPorTramo`), para poder mostrar "extras" (solo recargos) sin
+  recomputar y para congelarlo luego en el cierre.
+- Queries nuevas: CRUD de actividades/movimientos, `getCatalogoActivo/ById`,
+  `getEmpleadasActivas`, `getQuincenaById`, y agregados de quincena
+  (`agregadosTurnos/Actividades/Movimientos`, `contarPendientesPorEmpleada`).
+- Servicio: `construirResumen(quincenaId)` — arma la consulta en vivo componiendo
+  los agregados con el neto del core.
+- Bot:
+  - Botones de actividad en el panel de la empleada (una fila por
+    `catalogo_activo`, callback `act:<id>`) → registra sin aprobación y confirma
+    a la empleada **sin pesos**.
+  - Comandos del grupo admin en lenguaje natural: préstamo/bono con paso de
+    confirmación (Confirmar/Cancelar) antes de escribir, y consulta en vivo
+    («cómo va la quincena»). Guard de `chat_id` en toda escritura sensible.
+  - Formato: mensajes de actividad, confirmación/registro de movimientos y
+    resumen de quincena (empleada solo horas; admins con pesos).
+- Validación: 32 tests unitarios en verde + smoke de integración Fase 2 contra
+  el Postgres real (turno con `valor_extras` persistido, 2 actividades, un
+  préstamo, un bono, consulta en vivo con neto = $598.696, y Maye en base/2 =
+  $711.750). Bot reiniciado, polling limpio, miembro de los 3 grupos.
+
+**Decisiones tomadas:**
+- **Fórmula del neto (INTERPRETACIÓN — confirmar con Pablo):** el glosario dice
+  `neto = salario_base + extras + actividades + bonos − préstamos`. Se
+  implementó con: (a) "extras" = SOLO los recargos (extra diurna + nocturna +
+  dominical), NO el valor de las horas ordinarias, porque esas ya están
+  cubiertas por el salario base (sumarlas sería doble conteo); (b) "salario_base"
+  por quincena = `salario_base_mensual / 2`. Ambas viven en `src/core/quincena.ts`
+  y se cambian sin tocar el resto. En la consulta en vivo el neto sale etiquetado
+  como *preliminar* y con la fórmula visible.
+- **`turnos.valor_tramos`:** se agregó una columna (no estaba en el modelo del
+  doc) para guardar el valor en pesos por tramo. Es almacenamiento derivado que
+  el cierre necesitará congelar y que evita recomputar. Migración idempotente,
+  DB fresca (sin backfill).
+- **`parseMonto`:** número pelado < 10.000 sin separador = miles (×1000), porque
+  el ejemplo del doc "le presté 200 a Nena" significa $200.000; con separador
+  ("200.000") = literal; sufijos "mil"/"millón"/"k". Red de seguridad: la
+  confirmación SIEMPRE muestra el monto en pesos antes de escribir, así que un
+  error de interpretación se ve y se cancela.
+- **Préstamo/bono con confirmación** (Confirmar/Cancelar) antes de persistir
+  (sección 9.2). El pendiente vive en memoria, igual que las solicitudes de
+  fallback de la sesión anterior.
+- **Actividades sin aprobación ni notificación a admins** (sección 8.3): impacto
+  fijo y conocido. La empleada solo ve el nombre, nunca el valor.
+
+**Bugs encontrados y cómo se resolvieron:**
+- Ninguno de código. Un `Edit` a `queries.ts` chocó con dos coincidencias del
+  mismo patrón de cierre de función; se resolvió dando más contexto. `typecheck`
+  y los 32 tests quedaron en verde a la primera tras cablear todo.
+
+**Preguntas abiertas / pendiente para la próxima sesión:**
+- **CONFIRMAR la fórmula del neto** (extras = solo recargos; base/2 por
+  quincena). Es lo más importante a resolver antes de construir el cierre, porque
+  el snapshot congela ese número para siempre.
+- **Quincena "ajustable" en préstamos** (sección 9.2): hoy siempre usa la
+  quincena vigente. Elegir otra quincena destino queda pendiente.
+- **Catálogo de motivos de bonos configurable por admins** (sección 10): hoy el
+  motivo es una nota libre (texto tras "por"). Falta el catálogo editable.
+- **Estado en memoria:** los movimientos y solicitudes pendientes de confirmación
+  se pierden si el proceso reinicia. Persistir a futuro (tabla
+  `solicitudes_correccion` / equivalente).
+- **Fase final:** cierre de quincena (snapshot, bloqueo por pendientes) +
+  generación de Excel (`exceljs`) y PDF (secciones 12, 13). Depende de confirmar
+  rates (sesión 1) y la fórmula del neto (arriba).
+
+---
+
+## Sesión 3 — Confirmación de rates y fórmula del neto (desbloqueo del cierre)
+
+**Construido / decidido:**
+- Pablo confirmó los valores que estaban como placeholder o abiertos. Ya quedaron
+  cargados en el seed (`config_rates` fila vigente desde 2026-07-01) y en
+  `empleadas.salario_base_mensual`:
+  - **SMMLV 2026 = $1.750.905** (antes placeholder $1.423.500).
+  - **rec_extra_diurna = 0.25**, **rec_extra_nocturna = 0.75** (sin cambio).
+  - **rec_dominical = 1.00 (+100%)** — vigente desde el 1-jul-2026 por la reforma
+    laboral (antes 0.75).
+  - **Neto:** "extras" = solo recargos (no la parte ordinaria); salario base por
+    quincena = mensual / 2. CONFIRMADO — comentario actualizado en
+    `src/core/quincena.ts`.
+- Reset de `config_rates` (DELETE + re-seed) porque la fila placeholder tenía
+  `vigente_desde 2026-01-01`; la nueva entra como 2026-07-01. `empleadas` ahora
+  también actualiza `salario_base_mensual` en el ON CONFLICT del seed.
+
+**Decisiones tomadas:**
+- `config_rates.vigente_desde = 2026-07-01`: cubre el arranque real (1-ago) y el
+  demo de hoy; no se sembró una fila para el período enero–junio 2026 porque no
+  habrá datos antes del 1-ago y evita inventar el valor dominical pre-reforma. Si
+  algún día se necesita clasificar una fecha anterior, se agrega una fila previa.
+
+**Bugs encontrados y cómo se resolvieron:**
+- N/A.
+
+**Preguntas abiertas / pendiente para la próxima sesión:**
+- Ninguna bloqueante nueva. Todo listo para construir la **fase final**: cierre de
+  quincena (§12) + Excel/PDF (§13). Siguen pendientes (no bloqueantes) los ítems
+  de endurecimiento ya anotados en la sesión 2 (estado en memoria, quincena
+  ajustable en préstamos, catálogo de motivos de bonos, turnos que cruzan
+  medianoche).
+
+---
+
+## Sesión 4 — Cierre de quincena + Excel/PDF (secciones 12 y 13) · FASE 1 COMPLETA
+
+**Construido:**
+- Dependencias nuevas: `exceljs`, `pdfkit`, `node-cron`.
+- `src/jobs/cierre.ts`: `prepararCierre` (revisa pendientes SIN escribir, para
+  previsualizar) y `confirmarCierre` (congela snapshot + marca `cerrada`).
+- `src/jobs/scheduler.ts`: `node-cron` diario 23:00 hora Bogotá que dispara el
+  cierre en fecha de corte. La lógica de "día 15 o último del mes" es una función
+  pura testeada en core (`esFechaDeCorte`).
+- `src/reports/excel.ts` (exceljs): hojas Resumen / Turnos / Movimientos, con
+  formato de moneda y marca parcial/definitivo.
+- `src/reports/pdf.ts` (pdfkit): resumen por empleada + total neto, marca
+  parcial/definitivo. Devuelve Buffer.
+- `src/bot/servicio.ts` → `resumenParaReporte`: si la quincena está cerrada sirve
+  el snapshot congelado (definitivo); si está abierta calcula en vivo (parcial).
+- `src/core/comandosAdmin.ts`: intents nuevos `cerrar` y `reporte`
+  (excel/pdf/ambos) + tests. Total core: 36 tests.
+- Bot: comando «cerrar quincena» (preview del resumen + botones Confirmar/Cancelar
+  porque es irreversible), «dame el excel/pdf/reporte» bajo demanda (envía los
+  archivos como documentos, marcados parcial o definitivo), y el scheduler cableado
+  al arranque (cierre automático que además envía los reportes al grupo de admins).
+- Validación: 36 tests unitarios + smoke de integración de la fase final contra el
+  Postgres real: (1) cierre bloqueado por un pendiente en rango, (2) cierre OK con
+  snapshot + `cerrada_en` escritos, (3) reporte definitivo desde snapshot, (4) el
+  snapshot NO se recalcula —tras un préstamo posterior el reporte definitivo sigue
+  en $766.297 mientras el cálculo en vivo baja a $666.297—, (5) re-cierre
+  idempotente (`ya_cerrada`), (6) Excel y PDF reales generados y validados
+  (cabeceras PK / %PDF; el PDF se revisó visualmente).
+
+**Decisiones tomadas:**
+- **Cierre manual con confirmación** (preview + Confirmar/Cancelar) porque congela
+  pagos de forma permanente. El **cierre automático** (cron) cierra directo tras
+  pasar el chequeo de pendientes y envía los reportes. El `quincenaId` viaja en el
+  `callback_data` del botón de confirmar, así que el cierre manual sobrevive a un
+  reinicio (a diferencia de los movimientos, que sí usan memoria).
+- **Snapshot = objeto `Resumen` completo** (agregados + neto por empleada).
+  Escritura única garantizada: `marcarQuincenaCerrada` solo procede si la quincena
+  está `abierta`, y `confirmarCierre` maneja la carrera devolviendo `ya_cerrada`.
+- **Detalle de turnos/movimientos en los reportes se lee en vivo** (son
+  inmutables/append-only, no cambian tras el cierre); el neto autoritativo viene
+  del snapshot cuando la quincena está cerrada.
+- **Pendientes que bloquean** = eventos `pendiente` cuya hora declarada cae en el
+  rango de fechas de la quincena (acotado a la quincena, no global).
+- La **consulta en vivo** ahora también respeta el snapshot si la quincena está
+  cerrada (usa `resumenParaReporte`), para no “recalcular” lo congelado.
+
+**Bugs encontrados y cómo se resolvieron:**
+- El PDF mostraba el signo menos U+2212 («−») como comilla porque la fuente
+  Helvetica de pdfkit no lo tiene. Se cambió por guion ASCII «-» (y el símbolo ⚠
+  por «(!)»). Verificado regenerando y revisando el PDF.
+- **(Encontrado en prueba real en Telegram)** Pablo escribió «dame el pdf» y no
+  llegó nada. Dos problemas encadenados:
+  1. *Robustez:* el error del envío no estaba atrapado y **tumbó el proceso** (la
+     promesa de `bot.launch` se rechazó → `process.exit(1)`). Arreglos: `bot.catch`
+     global, `process.on('unhandledRejection')`, y el handler de comandos admin
+     envuelto en try/catch con aviso al usuario. Ahora ningún error de handler
+     mata el bot.
+  2. *Causa raíz del envío:* `sendDocument` fallaba SIEMPRE con «socket hang up»
+     (no era transitorio), mientras `sendMessage` funcionaba. Diagnóstico: `curl`
+     al mismo endpoint `sendDocument` funciona (HTTP 200) → la red está bien; el
+     problema es el cliente `node-fetch` viejo que trae Telegraf, cuyas subidas
+     *multipart* se cuelgan en **Node 26**. Fix: `enviarDocumentoAdmins` ahora usa
+     el `fetch`/`FormData`/`Blob` **nativos** de Node (no el cliente de Telegraf)
+     para subir el archivo, con reintentos. Verificado enviando un documento real
+     desde el runtime de Node (llegó ✅). `sendMessage` (JSON) se sigue usando vía
+     Telegraf sin problema.
+  Lección: en Node 26, evitar el `node-fetch@2` de Telegraf para *uploads*; usar
+  el fetch nativo.
+
+**Preguntas abiertas / pendiente para la próxima sesión:**
+- **La Fase 1 del documento técnico quedó COMPLETA** (secciones 1–13). No hay más
+  fases de construcción pendientes del alcance definido.
+- Mejoras futuras / endurecimientos (no bloqueantes), ya anotados: persistir el
+  estado en memoria (movimientos y solicitudes de fallback), quincena ajustable en
+  préstamos (§9.2), catálogo de motivos de bonos (§10), y turnos que cruzan
+  medianoche (no hay `fin_nocturno`).
+- Fuera de alcance por diseño: portal web de administración (Fase 2) y reemplazar
+  el Nivel 1 de interpretación por un LLM (§16).
+
+---
+
+## Sesión 5 — Correcciones post-demo (sección 19): saludo, novedad, screening, escalación, rangos, rates, corregir turno
+
+**Construido:**
+- **Core nuevo `src/core/screening.ts`** (funciones puras + 6 tests): `esSaludo`
+  (activación por saludo, 6.0), `tieneIndicioDeHora` (screening 7.0: ¿el mensaje
+  parece una marcación?) y `detectarTipoMarcacion` (entrada/salida por palabras
+  clave, 7.1). `interpretarCorreccion` ahora reusa `detectarTipoMarcacion` (una
+  sola fuente del vocabulario de marcación).
+- **Rango completo en `interpretarCorreccion`** (item 7, +6 tests): reconoce
+  "de 7:00 am a 4:00 pm" (y variantes "7am a 4pm", "7:00 - 16:00", "de 6 a 3")
+  además de un punto. Nuevo campo `rango: { entrada, salida }`. Se refactorizó la
+  extracción de un punto a `extraerHora(t, sesgo?)`; en rangos la entrada sesga a
+  AM y la salida a PM para evitar inversiones cuando no hay meridiem explícito.
+- **`segmentosDeTurno` en `clasificador.ts`** (item 9, +5 tests): devuelve los
+  tramos como rangos de reloj contiguos (recorre minuto a minuto con la MISMA
+  lógica que `clasificarTurno` y agrupa) — para el Excel/PDF. No se guarda nada
+  duplicado: se recalcula al generar el reporte.
+- **Comandos de admin nuevos en `comandosAdmin.ts`** (+3 tests): `parseFechaEspanol`
+  ("20 de julio", "20/07/2026", ISO), `interpretarCambioRate` (campo + valor, con
+  parsers de fracción/hora), e intents `rates-ver`, `rates-cambiar`,
+  `corregir-turno`. `interpretarComandoAdmin` toma ahora un tercer parámetro
+  `añoActual` (el bot pasa el año de Bogotá) para resolver fechas relativas.
+- **`formato.ts`**: plantilla EXACTA de la sección 7.4 (`msgConfirmacionTurno`,
+  item 8), mensaje final completo a la empleada (`msgCorreccionConfirmadaEmpleada`
+  ahora dice "Se confirmó tu entrada/salida a las H:MM AM/PM", item 6), escalación
+  de tipo (`msgAdminTipoDesconocido`), y formatters de rates y de corregir-turno.
+  Se agregó a `tiempo.ts`: `formatoHora12Desde`, `formatoFechaDMY(Desde)`.
+- **Bot (`index.ts`) reescrito** con todos los flujos de la sección 19:
+  - Activación por saludo además de `/start` (6.0) y botón **Generar novedad** →
+    Entrada/Salida → pide la hora → mismo mecanismo de aprobación con el tipo ya
+    resuelto (6.1).
+  - Screening (7.0): sin indicio de hora, el bot NO responde ni registra nada.
+  - Detección de tipo (7.1): si no se puede determinar, escala al grupo de admins
+    (NO a la empleada) con [Nueva entrada] [Nueva salida] [No es una novedad] +
+    **relay**: texto libre del admin (no reconocido como comando) se reenvía a la
+    empleada.
+  - "No, cambiar" con re-preview y rango (7.3): la corrección de salida ya no se
+    confirma en seco — vuelve a mostrar la vista previa 7.4 con el horario
+    ajustado (punto o rango completo) antes de confirmar.
+  - Comandos de rates (17): "cuáles son los rates" (con hora nocturna en AM/PM) y
+    "cambiar salario base a X" → vista previa + Confirmar/Cancelar → inserta una
+    fila nueva de `config_rates` (nunca en sitio).
+  - Corregir turno pasado (18), incluido turno partido: busca los turnos de la
+    fecha; si hay varios, botones para elegir; pide horario (punto/rango); vista
+    previa 7.4 → Confirmar/Cancelar; recalcula el turno con eventos corregidos.
+- **AM/PM (item 5):** auditado `formato.ts` — todas las horas de reloj pasan por
+  `formatoHora12`/`formatoHora12Desde`. Antes ya era conforme; lo nuevo (rango
+  7.4, hora de inicio nocturno en la vista de rates) lo mantiene. La única hora
+  literal restante es el EJEMPLO de instrucción "de 7:00 am a 4:00 pm" (ya con
+  AM/PM).
+- **DB/queries:** `config_rates` gana `creado_en` (desempate cuando hay dos
+  cambios de rate el mismo día; `getRatesVigentes` ordena por
+  `vigente_desde DESC, creado_en DESC`); `insertarConfigRates`;
+  `getTurnosDeEmpleadaEnFecha` / `getTurnoConEventosById` /
+  `getTurnosConEventosDeQuincena` (turno + eventos + rate para rangos y
+  corrección); `actualizarTurnoCorregido`; `getEmpleadaPorId`. Se eliminó
+  `getTurnosDeQuincena`/`TurnoDetalle` (quedaron muertos, reemplazados).
+- **Reports:** hoja "Turnos" del Excel con columnas Entrada, Salida y "Rangos por
+  tramo"; el PDF gana una sección "Detalle de turnos" con el rango del turno y de
+  cada tramo. Servicio: `turnosParaReporte`/`TurnoReporte` calcula los rangos con
+  `segmentosDeTurno`.
+- **Validación:** typecheck en verde; 58 tests de core en verde (36 previos + 22
+  nuevos); smoke de reportes (sin DB ni Telegram) generó Excel y PDF válidos con
+  un turno partido y un día dominical (cabeceras PK / %PDF).
+
+**Decisiones tomadas:**
+- **Re-preview en "No, cambiar" (7.3):** antes el ajuste de hora se confirmaba de
+  inmediato; ahora se modela una *propuesta de turno* que se vuelve a previsualizar
+  (formato 7.4) antes de confirmar — es el punto de la sección 7.4 ("atrapar una
+  interpretación equivocada antes de confirmar"). Al confirmar una propuesta con
+  rango que cambió la entrada, se crea un evento de corrección de entrada
+  (inmutabilidad: fila nueva encadenada por `corrige_evento_id`), se rechaza la
+  salida pendiente interpretada y se crea la salida confirmada, y se materializa el
+  turno. Un punto solo cambia la salida.
+- **Corregir turno pasado (18) respeta inmutabilidad y snapshot:** `turnos` es
+  derivada y se actualiza en sitio, pero las horas se corrigen con DOS eventos
+  nuevos confirmados (encadenados a los originales por `corrige_evento_id`) y el
+  turno se repunta a ellos. Si la quincena está **cerrada**, el snapshot NO se
+  toca (el mensaje se lo advierte al admin). El detalle de turnos del reporte se
+  lee en vivo, así que un turno corregido de una quincena cerrada muestra su nuevo
+  rango/valor mientras el neto congelado no cambia — exactamente lo que pide 18.5.
+- **Relay de tipo indeterminado (7.1):** el destino del relay es la escalación de
+  tipo *más reciente* sin resolver (`ultimaEscalacionTipoId`). El texto libre solo
+  se reenvía si NO es un comando reconocido (los comandos siguen ganando). Si hay
+  dos escalaciones simultáneas (Nena y Maye) y se resuelve la más reciente por
+  botón, la otra pierde su "turno" de relay pero sus botones siguen sirviendo.
+  Aceptado por baja frecuencia.
+- **Punto vs. rango donde solo cabe un punto:** en "Generar novedad" y en el
+  fallback (tipo ya conocido), si el texto trae un rango se usa el extremo que
+  corresponde al tipo (entrada→inicio, salida→fin).
+- **`interpretarCambioRate` — heurística de fracción:** "25" sin "%" se toma como
+  25% (los recargos reales son < 3); "0.25"/"1"/"100%" se respetan. Red de
+  seguridad: la confirmación siempre muestra "antes → después" antes de escribir.
+- **Corregir turno con un solo punto:** se interpreta como cambio de la HORA DE
+  SALIDA (se conserva la entrada). Un rango cambia ambas. Documentado por si algún
+  admin espera lo contrario.
+
+**Bugs encontrados y cómo se resolvieron:**
+- `noUnusedLocals`: tras mover `getEmpleadaPorId` a queries quedó un `import
+  { query }` sin usar en `index.ts` y `formatoHora12` sin usar → removidos.
+- `lineaTurno` recibía `desglose_tramos` como `Record<string, number>` pero
+  pedía `DesgloseTramos` → se normaliza dentro con defaults en 0.
+- El smoke de reportes falló por top-level await (el scratchpad se transpila como
+  CJS, misma nota de la sesión 1) → se envolvió en `async function main()`.
+
+**Preguntas abiertas / pendiente para la próxima sesión:**
+- **Falsos positivos del Nivel 1 con tipo conocido:** un mensaje con palabra clave
+  de marcación + un número suelto que no es hora (ej. "salí con 3 bolsas") se
+  interpreta como salida a las 3:00 PM y llega a admins como pendiente. La vista
+  previa 7.4 solo tiene [Sí] [No, cambiar] (así lo define el doc), no un
+  "descartar", así que un falso positivo quedaría pendiente y bloquearía el cierre
+  hasta resolverlo a mano. Es la limitación inherente de patrones que justifica el
+  posible upgrade a LLM (§16). Evaluar si conviene un "descartar" también en este
+  flujo.
+- **Estado en memoria** (ya anotado sesiones previas, ahora con más piezas):
+  solicitudes de fallback y de tipo, propuestas de turno y cambios de rate
+  pendientes viven en memoria; un reinicio los pierde. Persistir a futuro.
+- **Migración pendiente de correr en Railway:** `ALTER TABLE config_rates ADD
+  COLUMN IF NOT EXISTS creado_en` (idempotente) — correr `npm run migrate` en el
+  entorno real antes de usar los comandos de rates.
+- Sin cambios en el cierre ni el snapshot (fuera de alcance de este batch, como
+  pedía la sesión). Endurecimientos previos siguen abiertos (quincena ajustable en
+  préstamos §9.2, catálogo de motivos de bonos §10, turnos que cruzan medianoche).

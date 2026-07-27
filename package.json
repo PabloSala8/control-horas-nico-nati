@@ -1,0 +1,32 @@
+{
+  "name": "control-horas-nico-nati",
+  "version": "0.1.0",
+  "description": "Sistema de control de horas para Nico y Nati (cliente interno LeanRevenue)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "migrate": "tsx src/db/migrate.ts",
+    "seed": "tsx src/db/seed.ts",
+    "reset": "tsx src/db/migrate.ts && tsx src/db/seed.ts",
+    "test:core": "tsx --test src/core/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx watch src/bot/index.ts",
+    "start": "tsx src/bot/index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "node-cron": "^4.6.0",
+    "pdfkit": "^0.19.1",
+    "pg": "^8.13.1",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/node-cron": "^3.0.11",
+    "@types/pdfkit": "^0.17.6",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

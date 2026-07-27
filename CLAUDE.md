@@ -63,6 +63,11 @@ necesita importar algo de `/bot`, algo está mal ubicado.
   no solo el `user_id` del remitente.
 - **`quincenas.snapshot` es de solo escritura una vez cerrada.** Ningún
   proceso posterior debe recalcularlo.
+- **Toda hora que el bot muestre en cualquier mensaje lleva AM/PM
+  explícito, sin excepción.** Nunca "6:00" a secas.
+- **El bot nunca reacciona a texto que no contiene ningún indicio de
+  hora.** Ver sección 7.0 del documento técnico — evita spam en mensajes
+  de charla normal entre empleadas.
 
 ## Al iniciar una sesión
 

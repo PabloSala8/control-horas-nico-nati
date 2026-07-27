@@ -127,6 +127,18 @@ aprobación, el turno **no existe todavía** — solo existen los eventos. El
 turno se crea (o recalcula) en el momento en que ambos eventos del día quedan
 `confirmado`.
 
+**Turnos partidos (confirmado — sí ocurren):** una misma `empleada_id` puede
+tener **más de un `turno` en la misma `fecha`** (ej. bloque de mañana y
+bloque de tarde). La tabla ya lo soporta sin cambios — no hay restricción de
+unicidad por `(empleada_id, fecha)`. Los agregados de quincena simplemente
+suman todos los turnos del rango de fechas, sin importar cuántos bloques
+haya por día.
+
+**Invariante que hace esto seguro:** el sistema garantiza que una empleada
+**nunca tiene más de un bloque abierto a la vez** (ver regla en sección 6).
+Gracias a esto, cualquier "Salí" — por botón o por corrección en texto —
+nunca es ambiguo: siempre hay como máximo un bloque esperando cerrarse.
+
 ### `config_rates` (versionada por fecha — nunca se actualiza en sitio)
 | Campo | Tipo | Notas |
 |---|---|---|
@@ -221,13 +233,60 @@ valores en `config_rates` — el motor ya está diseñado para eso.
 
 ## 6. Flujo: marcación normal
 
-1. Empleada toca **Entré** en su grupo → se crea un `eventos_marcacion` tipo
-   `entrada`, estado `confirmado` (no requiere aprobación: registrar que
-   llegó no tiene impacto financiero por sí solo).
-2. Al final del turno, toca **Salí** → se crea un `eventos_marcacion` tipo
-   `salida`, estado `confirmado`.
+### 6.0 Activación del menú
+
+El bot despliega el menú de botones (Entré / Salí / Actividad / Generar
+novedad) cuando detecta un saludo común ("hola", "buenas", "buenos días",
+etc.) **o** el comando `/start` — ambos funcionan, ninguno es obligatorio.
+Cualquier otro texto que no sea un saludo ni parezca una hora (ver sección
+7.0) se ignora sin respuesta — el bot no reacciona a conversación normal
+entre las empleadas.
+
+### 6.1 "Generar novedad" (flujo guiado)
+
+Para cuando se le olvidó marcar entrada o salida a tiempo. Es la vía
+**recomendada** sobre escribir texto libre, porque el tipo queda explícito
+por botón en vez de tener que inferirlo del mensaje:
+
+1. Empleada toca **Generar novedad**.
+2. El bot pregunta: *¿Qué se te olvidó marcar?* → botones **Entrada** /
+   **Salida**.
+3. El bot pide la hora (respuesta en texto libre, ej. "7:30 am").
+4. A partir de aquí sigue exactamente el mismo mecanismo de aprobación de
+   la sección 7 (`pendiente` → notificación a admins con impacto en pesos →
+   Confirmar/Ajustar) — la única diferencia es que el **tipo** (entrada o
+   salida) ya viene resuelto por el botón, no por interpretación de texto.
+
+### 6.2 Marcación por botón
+
+1. Empleada toca **Entré** en su grupo → el bot revisa si ya existe un
+   bloque abierto (una `entrada` `confirmado` sin `salida` `confirmado`
+   correspondiente) para esa empleada:
+   - **Si no hay bloque abierto:** se crea un `eventos_marcacion` tipo
+     `entrada`, estado `confirmado` directo (no requiere aprobación:
+     registrar que llegó no tiene impacto financiero por sí solo). Esto
+     soporta turnos partidos con normalidad — un segundo "Entré" después de
+     haber cerrado el primer bloque con "Salí" simplemente abre un bloque
+     nuevo el mismo día.
+   - **Si ya hay un bloque abierto** (la empleada toca "Entré" de nuevo sin
+     haber marcado "Salí" del anterior): **no se abre un bloque nuevo.** Se
+     trata como una corrección a la hora de entrada del bloque abierto —
+     sigue el mismo mecanismo de la sección 7 (`pendiente`, notificación a
+     admins, aprobación). Regla de negocio confirmada explícitamente: un
+     segundo "Entré" sin "Salí" de por medio significa "corregir mi hora de
+     entrada", no "empezar un bloque nuevo".
+   - *Simplificación aceptada:* si una empleada de verdad trabajó dos
+     bloques pero olvidó marcar "Salí" del primero antes de tocar "Entré"
+     del segundo, esta regla lo va a interpretar como corrección del primer
+     bloque. Es un caso de baja frecuencia, recuperable a mano por un admin
+     desde el grupo de admins.
+2. Al final del bloque, toca **Salí** → se crea un `eventos_marcacion` tipo
+   `salida`, estado `confirmado`. Gracias al invariante de "máximo un
+   bloque abierto a la vez", esto siempre cierra el bloque correcto sin
+   ambigüedad, incluso con turnos partidos.
 3. El motor se dispara automáticamente, crea el `turno`, lo asocia a la
-   `quincena` vigente según la fecha.
+   `quincena` vigente según la fecha. Un mismo día puede tener varios
+   `turno` (uno por bloque) para la misma empleada.
 4. El bot confirma en el grupo de la empleada solo con horas — nunca con
    pesos.
 
@@ -235,21 +294,116 @@ valores en `config_rates` — el motor ya está diseñado para eso.
 
 Ejemplo: la empleada olvidó marcar y escribe "hoy salí a las 3".
 
-1. El bot interpreta la hora contra el turno esperado de esa empleada ese
-   día (usa el horario habitual como referencia de desambiguación, nunca
-   adivina sin mostrar su interpretación).
-2. Crea un `eventos_marcacion` con `momento_declarado` = la hora indicada,
-   `momento_mensaje` = cuándo se escribió, estado `pendiente`,
-   `corrige_evento_id` apuntando al evento original si existía uno.
-3. Responde en el grupo de la empleada: *"Anoté tu salida a las 3:00 PM — en
-   revisión"* — sin mencionar horas extra ni montos.
-4. Envía al grupo de admins la solicitud con el impacto ya calculado en
-   pesos, y dos botones: Confirmar / Ajustar hora.
-5. Si Nico o Nati confirman: el evento pasa a `confirmado`, se dispara el
-   motor, se crea o recalcula el `turno`, y el bot avisa en el grupo de la
-   empleada que quedó confirmado (sin montos).
-6. Si nadie responde: el evento queda `pendiente` indefinidamente. Este
-   estado **bloquea el cierre de quincena** — no se resuelve solo.
+**Decisión de diseño (confirmada):** este flujo se construye sin depender
+de ningún proveedor de LLM externo (Gemini/Kimi quedó como mejora futura
+opcional, ver sección 16). Usa un enfoque de tres pasos que nunca deja al
+sistema adivinar sin red de seguridad, y que **nunca reacciona a mensajes
+que no son intentos de marcación** (una empleada saludando, charlando, etc.
+no debe generar ninguna respuesta del bot).
+
+### 7.0 Paso 1 — Screening: ¿esto parece una hora?
+
+Antes de cualquier otra cosa, el bot revisa si el mensaje contiene algún
+indicio de hora: números que parezcan reloj ("a las 3", "3pm", "3:30"), o
+palabras clave de marcación ("llegué", "entré", "salí", "entrada",
+"salida"). **Si no hay ningún indicio → el bot no hace nada.** No responde,
+no crea ningún registro. Esto es lo que evita que el bot reaccione a un
+"hola" o cualquier charla normal del grupo como si fuera una corrección.
+
+Si sí hay indicio de hora, sigue al paso 2.
+
+### 7.1 Paso 2 — ¿Está claro el tipo (entrada o salida)?
+
+El bot busca palabras clave de tipo: "llegué"/"entré"/"llegada"/"entrada" →
+`entrada`; "salí"/"salida" → `salida`.
+
+- **Si el tipo es claro:** sigue directo al paso 3 (interpretación de la
+  hora).
+- **Si el tipo NO es claro** (hay una hora pero ninguna palabra que indique
+  cuál es): el bot **no le pregunta a la empleada** — escala directo al
+  grupo de admins con el texto original y tres botones: **Nueva entrada** /
+  **Nueva salida** / **No es una novedad**.
+  - Si un admin toca **Nueva entrada** o **Nueva salida**, el bot continúa
+    al paso 3 con el tipo ya resuelto.
+  - Si toca **No es una novedad**, se descarta sin crear ningún registro.
+  - **Relay de texto libre:** si en vez de tocar un botón el admin responde
+    con texto normal, el bot reenvía ese texto tal cual al grupo de la
+    empleada correspondiente, como mensaje del admin. Esto evita que Nico o
+    Nati tengan que aprender sintaxis especial para el caso raro — pueden
+    simplemente responder como personas y el bot hace de puente.
+
+### 7.2 Paso 3 — Interpretación de la hora (Nivel 1)
+
+El bot intenta extraer una hora del mensaje con reglas/patrones básicos
+(números, "a la(s) X", "X am/pm", "X:XX", "el mediodía"). Gracias al
+invariante de bloque único abierto (sección 6), no hace falta desambiguar
+*a qué bloque* se refiere — solo hay uno esperando cerrarse (o abrirse, si
+es una corrección de entrada).
+
+**Regla no negociable: toda hora que el bot muestre, en cualquier mensaje,
+siempre lleva AM/PM explícito.** Nunca "6:00" a secas — siempre "6:00 AM" o
+"6:00 PM". Esto es lo que le permite a un admin atrapar una interpretación
+equivocada *antes* de confirmar, en vez de descubrirla después.
+
+**Si el Nivel 1 interpreta con claridad:**
+- Crea un `eventos_marcacion` con `momento_declarado` = la hora
+  interpretada, `momento_mensaje` = cuándo se escribió, estado `pendiente`,
+  `corrige_evento_id` apuntando al evento que corrige (si aplica).
+- Responde en el grupo de la empleada: *"Anoté tu salida a las 3:00 PM — en
+  revisión"* — sin mencionar horas extra ni montos.
+- Envía al grupo de admins la solicitud con el impacto ya calculado en
+  pesos, en el formato de la sección 7.4, con botones **Sí** / **No,
+  cambiar**.
+
+**Si el Nivel 1 no logra interpretar la hora con confianza** (esto solo
+puede pasar ya con el tipo resuelto — ver 7.1): no adivina. Envía al grupo
+de admins el texto original tal cual, sin hora sugerida — el admin escribe
+la hora correcta directamente (mismo mecanismo de relay de texto libre que
+en 7.1).
+
+### 7.3 Aprobación y "No, cambiar" con rango completo
+
+Si un admin toca **No, cambiar**, el bot pide el horario correcto (ej.
+*"Escribe el horario correcto, ej: de 7:00 am a 4:00 pm"*). Esta respuesta
+puede ser un **rango completo** (dos horas, ej. "de 7:00 am a 4:00 pm"), no
+solo un punto — el Nivel 1 debe reconocer ambos casos. El bot vuelve a
+mostrar la vista previa (sección 7.4) con el horario ajustado para
+confirmar de nuevo.
+
+Cuando se confirma (con **Sí** directo, o después de uno o más ajustes): el
+evento pasa a `confirmado`, se dispara el motor, se crea o recalcula el
+`turno`, y el bot avisa en el grupo de la empleada con el **mensaje
+completo de lo que quedó confirmado** — nunca un genérico "confirmado".
+Ejemplo: *"✅ Se confirmó tu entrada a las 6:00 AM"* — el valor final
+aprobado, aunque sea distinto al que ella escribió originalmente.
+
+Si nadie responde: el evento queda `pendiente` indefinidamente. Este estado
+**bloquea el cierre de quincena** — no se resuelve solo.
+
+### 7.4 Formato de confirmación al grupo de admins
+
+```
+✅ Turno — Nena
+📅 22/07/2026 · 6:00 AM – 5:00 PM (11h)
+
+Ordinarias: 7h
+Extra diurna: 4h
+Total: $100.052
+
+¿Confirmas este horario?
+[Sí]  [No, cambiar]
+```
+
+Notación siempre en formato 12 horas + AM/PM, nunca mezclada con 24 horas
+(evita ambigüedades como "17:00pm").
+
+**Nota de arquitectura:** la función de interpretación (Nivel 1) debe vivir
+detrás de una única función en `/src/core` (ej. `interpretarCorreccion()`),
+sin que el resto del código sepa cómo está implementada por dentro. Si en
+el futuro se decide reemplazarla por una llamada a un LLM (Gemini, Kimi,
+u otro) para subir el porcentaje de mensajes interpretados en el Nivel 1,
+solo se toca esa función — el flujo de aprobación y todo lo demás queda
+igual.
 
 ## 8. Flujo: actividad extra (Rococó / Gatas)
 
@@ -303,6 +457,16 @@ adjunto en el chat.
   foto del momento en que se pidió.
 - Si se pide **después del cierre**: es la versión ya congelada y definitiva.
 
+**Detalle de horas en la hoja "Turno":** además de las horas totales por
+tipo, la hoja debe mostrar el rango de reloj de cada tramo — hora de entrada
+y salida del turno, y de qué hora a qué hora corresponde cada tramo
+(ordinaria, extra diurna, extra nocturna, dominical/festivo). Estos rangos
+**se recalculan al generar el reporte** a partir de la entrada/salida real y
+las mismas reglas del motor de clasificación (sección 5) — no se guardan
+duplicados en la base de datos, para no tener dos fuentes de verdad que
+puedan desincronizarse. Notación siempre en formato 12 horas + AM/PM (ver
+sección 7.4).
+
 ## 14. Glosario
 
 | Término | Significado |
@@ -319,18 +483,93 @@ Sin fechas asociadas — es el orden lógico de dependencias, no un cronograma:
 
 1. Modelo de datos y migraciones.
 2. Motor de clasificación de horas como función pura, testeada sin el bot.
-3. Bot: comandos de entrada/salida/actividad en los grupos de empleadas.
-4. Flujo de corrección en lenguaje natural + aprobación en grupo de admins.
+3. Bot: comandos de entrada/salida/actividad en los grupos de empleadas,
+   incluyendo la regla de doble "Entré" → corrección (sección 6).
+4. Flujo de corrección en lenguaje natural (Nivel 1 + fallback a admin) +
+   aprobación en grupo de admins (sección 7). Ya no depende de ninguna
+   decisión de proveedor LLM pendiente.
 5. Préstamos y bonos.
 6. Consulta en vivo.
 7. Cierre de quincena automático + generación de Excel/PDF.
 8. Excel/PDF bajo demanda con marca de parcial.
 
-## 16. Preguntas abiertas (resolver antes de construir esa parte)
+## 17. Editar rates (admins)
 
-- ¿Cómo se desambigua exactamente "salí a las 3" cuando el turno esperado
-  tiene tramos de mañana y tarde (caso histórico de Maye en el Excel viejo)?
-  Definir la regla de referencia antes de construir el paso 4.
-- ¿Qué pasa si una empleada marca "Entré" dos veces seguidas sin salida
-  intermedia? Debe quedar una regla explícita (ej. la segunda entrada se
-  ignora con aviso, o sobrescribe la anterior como corrección).
+Hoy los rates solo se cargan por seed/migración — no hay comando en el bot.
+Se agrega siguiendo el mismo patrón ya usado en préstamos y bonos (mensaje
+en lenguaje natural → vista previa → Confirmar/Cancelar):
+
+- **Consultar:** *"cuáles son los rates"* → el bot muestra la fila vigente
+  de `config_rates` completa (salario base, divisor, recargos, inicio
+  nocturno).
+- **Cambiar:** *"cambiar salario base a 1.800.000"* (o cualquier otro
+  campo) → el bot muestra una vista previa de la fila **nueva** que se va a
+  insertar (recuerda: `config_rates` nunca se edita en sitio, sección 4) con
+  el resto de campos sin cambio, y botones **Sí** / **Cancelar**. Al
+  confirmar, `vigente_desde` = fecha del día en que se hace el cambio.
+
+No requiere una segunda aprobación de otro admin — quien lo pide y lo
+confirma es la misma persona, igual que con préstamos y bonos.
+
+## 18. Corregir un turno pasado (admins)
+
+Distinto del flujo de corrección de la sección 7: ahí se corrige un bloque
+**abierto** (todavía sin cerrar). Aquí se corrige un turno que **ya está
+confirmado y cerrado**, de cualquier fecha pasada.
+
+1. Admin escribe algo como *"corregir turno de Nena del 20 de julio"*.
+2. El bot busca los turnos de esa empleada en esa fecha:
+   - Si hay uno solo, lo muestra (rango de horas + desglose) y pide el
+     horario correcto.
+   - Si hay más de uno (turno partido ese día), muestra ambos con su rango
+     de horas y pregunta cuál se va a corregir.
+3. Admin da el horario correcto (punto o rango, igual que en 7.3).
+4. El bot muestra la vista previa del turno recalculado (mismo formato de
+   7.4) con botones **Sí** / **Cancelar**.
+5. Al confirmar, se recalcula ese `turno` con el motor. Si esa quincena ya
+   estaba **cerrada** (snapshot congelado), el snapshot **no se toca** — la
+   corrección queda reflejada en el turno individual pero no altera un
+   cierre ya congelado (mismo principio de la sección 12: lo cerrado no se
+   recalcula). El admin debe saber que corregir un turno de una quincena ya
+   cerrada no cambia el neto que ya se pagó — si eso es necesario, es una
+   conversación aparte, no automática.
+
+Misma regla que en la sección 17: quien lo pide y lo confirma es la misma
+persona, sin segunda aprobación.
+
+## 19. Orden de construcción — Sesión 5 (correcciones post-demo)
+
+Sin fechas asociadas — orden lógico de dependencias sobre lo ya construido:
+
+1. Activación por saludo + `/start` (6.0) y flujo guiado "Generar novedad"
+   (6.1).
+2. Screening de mensajes (7.0) — el bot deja de reaccionar a texto que no
+   parece una hora.
+3. Detección de tipo por palabras clave + escalación a admins con relay de
+   texto libre (7.1).
+4. AM/PM explícito en todos los mensajes + mensaje final completo a la
+   empleada (7.2-7.3).
+5. Reconocimiento de rango completo en "No, cambiar" (7.3).
+6. Formato de confirmación unificado (7.4).
+7. Rangos de horas por tramo en Excel/PDF (sección 13).
+8. Comandos de editar rates (sección 17).
+9. Comando de corregir turno pasado (sección 18).
+
+Las dos preguntas abiertas originales quedaron resueltas y ya están
+incorporadas en las secciones 4, 6 y 7:
+
+- **Turnos partidos:** sí ocurren. Resuelto con el invariante de "máximo un
+  bloque abierto a la vez" (secciones 4 y 6) — elimina la ambigüedad sin
+  necesidad de lógica adicional de desambiguación.
+- **Doble "Entré" sin "Salí" de por medio:** se trata como corrección a la
+  entrada existente, no como apertura de un bloque nuevo (sección 6).
+  Simplificación aceptada y documentada: el caso borde de un turno partido
+  real donde se olvida marcar "Salí" del primer bloque queda como
+  corrección manual vía el grupo de admins, no como bug.
+
+**Mejora futura opcional (no bloqueante):** reemplazar el Nivel 1 de
+interpretación de la sección 7 (reglas/patrones simples) por una llamada a
+un proveedor de LLM (Gemini Flash-Lite u otro) para subir el porcentaje de
+mensajes que el bot interpreta sin intervención de un admin. Se decide
+cuando haya evidencia real de cuántos mensajes caen al fallback manual —
+no antes.
