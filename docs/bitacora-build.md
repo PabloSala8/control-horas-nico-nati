@@ -496,3 +496,92 @@ editables sin tocar código porque son filas de `config_rates`):*
 - Sin cambios en el cierre ni el snapshot (fuera de alcance de este batch, como
   pedía la sesión). Endurecimientos previos siguen abiertos (quincena ajustable en
   préstamos §9.2, catálogo de motivos de bonos §10, turnos que cruzan medianoche).
+
+## Sesión 6 — Correcciones post-demo (batch 2), guía en chat, actividades al cerrar/corregir + prep de despliegue Railway
+
+**Construido:**
+- **Rango + aviso al cerrar turno (corrección #1):** al tocar *Salí*, la empleada
+  ahora ve el rango `entrada – salida` además de la duración. Cada turno que la
+  empleada cierra sola dispara un aviso al grupo de admins (`msgAdminTurnoCerrado`)
+  con botón *✏️ Corregir* que entra directo al flujo de §18 (reusa `ct:pick:<id>`).
+  Solo en la vía botón *Salí* — en las correcciones aprobadas los admins ya vieron
+  el turno, sería ruido.
+- **Regla de no-solape / máx-2 turnos por día (corrección #2):** vive en
+  `materializarTurno` (servicio), el punto único por donde pasa TODA creación de
+  turnos. Nueva `turnoEnConflicto(empleadaId, entrada, salida, excluirTurnoId?)` y
+  el puro `intervalosSeCruzan` en `tiempo.ts` (+2 tests; extremos que se tocan NO
+  cruzan → mañana+tarde válido). `materializarTurno` pasó a devolver
+  `ResultadoMaterializacion` (`{ok, resultado, turnoId} | {ok:false, conflicto}`);
+  se actualizaron todos sus llamadores. Validado además ANTES de crear eventos en
+  las vías de empleada (marca:salida, registrarPropuestaHora) para no dejar
+  huérfanos, y como guard en las de admin (ap:confirm, reprevisar-salida,
+  corregir-turno).
+- **Comando "borrar base de datos" (corrección #3, solo dev):** intent `reset-db`
+  en `comandosAdmin` (+test), `resetDatosOperativos()` hace
+  `TRUNCATE turnos, actividades, movimientos, eventos_marcacion, quincenas`
+  (conserva empleadas/admins/rates/festivos). Confirmación Sí/No con token de un
+  solo uso (botón viejo → "expiró", nunca borra por accidente) y limpieza del
+  estado en memoria tras el reset. Desbloquea el testing cuando una quincena quedó
+  cerrada.
+- **Guía en chat:** `esGuia` en `screening.ts` (+tests) e intent `guia` en
+  `comandosAdmin` (+test). Escribir «guía»/«instrucciones»/«ayuda»/«comandos» manda
+  `msgGuiaEmpleada` (solo botones y horas, sin pesos) en los grupos de empleada, o
+  `msgGuiaAdmin` (todos los comandos) en el grupo de admins.
+- **Actividades del día al cerrar y al corregir:** `getActividadesDeEmpleadaEnFecha`.
+  El resumen en vivo ya las contaba; el hueco era el mensaje de cierre. Nuevo
+  `bloqueValorAdmin(valorTurno, acts)` compartido por los tres mensajes de admin
+  (turno cerrado, preview de corrección, corrección final): sin actividades muestra
+  `Total: $X`; con actividades muestra `Turno` + `Actividades hoy` + `Total del día`.
+  La empleada ve solo `➕ Hoy también: ...` (sin pesos).
+- **Rename Rococó → Rocco:** en seed (con `UPDATE ... WHERE nombre='Rococó'`
+  idempotente para renombrar la fila existente sin duplicar el botón), schema,
+  guía y mensajes.
+- **Prep de despliegue Railway (sin lógica):**
+  - `engines: { node: "26.x" }` en package.json.
+  - `tsx` movido de `devDependencies` a `dependencies` (es el runtime en prod).
+  - Confirmado: `scheduler.ts` ya fija `timezone: 'America/Bogota'` explícito.
+  - Confirmado: `start` corre el mismo entrypoint que `dev` (`tsx src/bot/index.ts`).
+  - Confirmado: `migrate`/`seed` leen `DATABASE_URL` de `process.env`; dotenv v16
+    NO sobrescribe la variable del shell (verificado empíricamente), así que
+    `DATABASE_URL=<url-railway> npm run migrate` apunta a Railway sin tocar código.
+
+**Decisiones de implementación:**
+- **No-solape RECHAZA, no reemplaza.** Auto-reemplazar sería pérdida de datos
+  silenciosa y ambigua. El "reemplazo" legítimo es *corregir turno* (UPDATE en
+  sitio, no duplica); por eso el aviso de conflicto trae el botón *Corregir*.
+- **`Total del día` = turno + actividades del día.** En un turno partido puede
+  aparecer en el aviso de ambos turnos; el número autoritativo (que cuenta cada
+  actividad una vez) sigue siendo el resumen de quincena. Para el caso normal
+  (un turno/día) es exacto.
+- **Borrar BD conserva la referencia** (empleadas, admins, rates, festivos) para
+  que el bot siga funcionando sin re-seed. Reset TOTAL = `npm run reset` en terminal.
+- **`tsx` a `dependencies`:** Nixpacks puede instalar con `NODE_ENV=production` y
+  omitir devDependencies; sin `tsx` el `npm start` (`tsx src/bot/index.ts`) fallaría.
+  `typescript` y `@types/*` se quedan en devDependencies (solo para `typecheck`).
+
+**Bugs / hallazgos:**
+- **Causa raíz del solape (capturas del PDF):** reingresar «entré a las 7» después
+  de un turno ya cerrado abría un bloque nuevo, y «salí a las 6pm» creaba un segundo
+  turno ENCIMA del primero. Ninguna regla lo impedía. El flujo *corregir turno*
+  (UPDATE) nunca duplicó — el problema era crear turnos nuevos cruzados.
+- **`msgConfirmacionTurno` / `msgTurnoCorregido` perdían las actividades:** al
+  corregir un turno con un Rocco registrado, el preview y la confirmación final no
+  lo mostraban ni lo sumaban (reportado con captura). Se unificó con `bloqueValorAdmin`.
+- **Bloqueador de despliegue:** `tsx` estaba en devDependencies → movido a deps.
+
+**Pendiente para la próxima sesión:**
+- **Correr en Railway (idempotentes) antes de usar el bot:** `npm run migrate`
+  (incluye el `ALTER TABLE config_rates ADD COLUMN creado_en` de la sesión 5) y
+  `npm run seed` (aplica el rename Rococó→Rocco a la fila existente; "borrar base
+  de datos" conserva el catálogo, así que la fila vieja persiste hasta sembrar).
+- **Bloque abierto huérfano tras rechazo por solape:** si una salida se rechaza por
+  cruce, el bloque de entrada queda abierto. Se resuelve corrigiendo el turno
+  existente o con "borrar base de datos". Ofrecido (no hecho) un "cancelar turno
+  abierto" para la empleada.
+- **Consistencia pendiente:** la corrección por texto «salí a las X» aún no muestra
+  actividades en su preview (mismo patrón, no aplicado por alcance).
+- **`@types/node` en `^22` mientras el runtime es Node 26** — solo afecta typecheck,
+  no runtime. Evaluar bump.
+- Sigue abierto: estado en memoria volátil (reinicio pierde solicitudes/propuestas
+  a medio resolver), quincena ajustable en préstamos §9.2, catálogo de motivos de
+  bonos §10, turnos que cruzan medianoche.
