@@ -38,25 +38,24 @@ const FESTIVOS_2026: Array<[string, string]> = [
 ];
 
 async function seedAdmins(): Promise<string> {
-  // Nico y Nati comparten el mismo grupo de admins (chat_id_admin).
-  await pool.query(
-    `INSERT INTO admins (nombre, telegram_user_id, chat_id_admin)
-     SELECT $1, $2, $3
-     WHERE NOT EXISTS (SELECT 1 FROM admins WHERE nombre = $1)`,
-    ['Nico', null, config.adminChatId],
-  );
-  const nati = await pool.query<{ id: string }>(
-    `INSERT INTO admins (nombre, telegram_user_id, chat_id_admin)
-     SELECT $1, $2, $3
-     WHERE NOT EXISTS (SELECT 1 FROM admins WHERE nombre = $1)
-     RETURNING id`,
-    ['Nati', null, config.adminChatId],
-  );
-  // id de Nati (para creado_por en config_rates); si ya existía, lo buscamos.
-  const natiId =
-    nati.rows[0]?.id ??
-    (await pool.query<{ id: string }>(`SELECT id FROM admins WHERE nombre = 'Nati'`)).rows[0].id;
-  console.log('✔ admins: Nico y Nati');
+  // Nico y Nati comparten el mismo grupo de admins. chat_id_admin se SINCRONIZA
+  // desde el .env en cada seed (fuente única del ID): UPDATE por nombre (estable)
+  // para preservar el id — natiId es FK de config_rates.creado_por.
+  for (const nombre of ['Nico', 'Nati']) {
+    const upd = await pool.query(`UPDATE admins SET chat_id_admin = $1 WHERE nombre = $2`, [
+      config.adminChatId,
+      nombre,
+    ]);
+    if (upd.rowCount === 0) {
+      await pool.query(
+        `INSERT INTO admins (nombre, telegram_user_id, chat_id_admin) VALUES ($1, NULL, $2)`,
+        [nombre, config.adminChatId],
+      );
+    }
+  }
+  const natiId = (await pool.query<{ id: string }>(`SELECT id FROM admins WHERE nombre = 'Nati'`))
+    .rows[0].id;
+  console.log('✔ admins: Nico y Nati (chat_id_admin sincronizado desde .env)');
   return natiId;
 }
 
@@ -66,16 +65,23 @@ async function seedEmpleadas(): Promise<void> {
     ['Mayerlis (Maye)', 'Maye', config.mayeChatId],
   ];
   for (const [nombre, alias, chatId] of empleadas) {
-    await pool.query(
-      `INSERT INTO empleadas (nombre, alias, telegram_user_id, chat_id_grupo, salario_base_mensual, activa)
-       VALUES ($1, $2, NULL, $3, $4, true)
-       ON CONFLICT (chat_id_grupo) DO UPDATE
-         SET nombre = EXCLUDED.nombre, alias = EXCLUDED.alias,
-             salario_base_mensual = EXCLUDED.salario_base_mensual`,
-      [nombre, alias, chatId, SMMLV_2026],
+    // chat_id_grupo se SINCRONIZA desde el .env (fuente única de los IDs de grupo).
+    // UPDATE por alias (estable) para NO crear duplicados si el chat_id cambió
+    // (p.ej. un grupo que pasa a supergrupo) y preservar el id de la empleada
+    // (FK de turnos/eventos). Si aún no existe, se inserta.
+    const upd = await pool.query(
+      `UPDATE empleadas SET chat_id_grupo = $1, nombre = $2, salario_base_mensual = $3 WHERE alias = $4`,
+      [chatId, nombre, SMMLV_2026, alias],
     );
+    if (upd.rowCount === 0) {
+      await pool.query(
+        `INSERT INTO empleadas (nombre, alias, telegram_user_id, chat_id_grupo, salario_base_mensual, activa)
+         VALUES ($1, $2, NULL, $3, $4, true)`,
+        [nombre, alias, chatId, SMMLV_2026],
+      );
+    }
   }
-  console.log('✔ empleadas: Nena y Maye');
+  console.log('✔ empleadas: Nena y Maye (chat_id_grupo sincronizado desde .env)');
 }
 
 async function seedConfigRates(natiId: string): Promise<void> {

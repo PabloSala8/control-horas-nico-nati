@@ -673,3 +673,42 @@ editables sin tocar código porque son filas de `config_rates`):*
   datos reales.
 - El PDF (§13) sigue con el detalle combinado (no era alcance de esta sesión); si se
   quisiera la misma separación por empleada, es un cambio análogo en `pdf.ts`.
+
+## Sesión 9 — Fix: Nena/Maye dejaron de responder al volverse supergrupos (chat_id cambió)
+
+**Incidente (producción):** Nena y Maye convirtieron sus grupos en supergrupos;
+Telegram les asignó un `chat_id` nuevo (formato `-100…`). El bot dejó de
+responderles, aunque el grupo de admin seguía bien. Se actualizaron
+`NENA_CHAT_ID`/`MAYE_CHAT_ID` en Railway pero NO se arregló.
+
+**Causa raíz:** la identificación de empleada en runtime es contra la DB, no contra
+el `.env`. `getEmpleadaPorChat(ctx.chat.id)` hace
+`SELECT * FROM empleadas WHERE chat_id_grupo = $1`. Las env vars
+`NENA_CHAT_ID`/`MAYE_CHAT_ID` **solo se leen en el seed** para poblar
+`empleadas.chat_id_grupo`; en runtime nunca. Así que la DB seguía con los IDs
+viejos. El grupo de admin sí funciona porque su guard (`esChatAdmin`) compara
+directo contra `config.adminChatId` (env), no contra la DB.
+
+**Fix inmediato (SQL, corrido una vez contra Railway):**
+```sql
+UPDATE empleadas SET chat_id_grupo = -1004354915379 WHERE alias = 'Nena';
+UPDATE empleadas SET chat_id_grupo = -1003963436336 WHERE alias = 'Maye';
+```
+(IDs nuevos: ADMIN `-1004323883053`, NENA `-1004354915379`, MAYE `-1003963436336`.)
+
+**Prevención (para no tocar dos lugares nunca más):** se reescribió el seed para
+que el `.env` sea la ÚNICA fuente de los IDs de grupo. `seedEmpleadas` y
+`seedAdmins` ahora **sincronizan** `chat_id_grupo` / `chat_id_admin` desde el env
+con UPDATE por clave estable (alias / nombre) — preservan el `id` de la fila (FKs
+de turnos/eventos/config_rates intactas) y no crean duplicados aunque el chat_id
+cambie. Antes `seedEmpleadas` hacía `ON CONFLICT (chat_id_grupo)`, que ante un
+chat_id NUEVO no encontraba conflicto e insertaba un duplicado en vez de actualizar.
+
+**Flujo recomendado a futuro si un grupo cambia de ID:** actualizar la env var en
+Railway y correr `DATABASE_URL=<url-publica> npm run seed` (idempotente) — re-sincroniza
+los tres IDs a la DB sin SQL manual ni duplicados. El fix SQL de arriba fue solo
+porque el seed viejo aún estaba desplegado.
+
+**Nota:** el fix del seed hay que **desplegarlo** (push + redeploy) para que el
+flujo `npm run seed` quede disponible; el `UPDATE` manual ya dejó el bot operativo
+sin esperar al deploy.
