@@ -401,6 +401,7 @@ export interface TurnoConEventos {
   empleada_id: string;
   horas_totales: string;
   desglose_tramos: Record<string, number>;
+  valor_tramos: Record<string, number>; // pesos por tramo (para desglosar extras en el reporte)
   valor_calculado: number;
   rates_id: string;
   quincena_id: string | null;
@@ -414,7 +415,7 @@ export interface TurnoConEventos {
 
 const SELECT_TURNO_EVENTOS = `
   SELECT t.id, t.fecha, em.alias, t.empleada_id, t.horas_totales, t.desglose_tramos,
-         t.valor_calculado, t.rates_id, t.quincena_id, t.entrada_evento_id, t.salida_evento_id,
+         t.valor_tramos, t.valor_calculado, t.rates_id, t.quincena_id, t.entrada_evento_id, t.salida_evento_id,
          ev_in.momento_declarado  AS entrada_declarado,
          ev_out.momento_declarado AS salida_declarado,
          cr.divisor_horas, cr.inicio_nocturno
@@ -615,6 +616,28 @@ export async function getActividadesDeEmpleadaEnFecha(
       WHERE a.empleada_id = $1 AND a.fecha = $2
       GROUP BY c.nombre ORDER BY c.nombre`,
     [empleadaId, fecha],
+  );
+  return r.rows;
+}
+
+/** Detalle de actividades de una quincena por empleada y día (para el Excel §13.1). */
+export interface ActividadReporteDetalle {
+  empleada_id: string;
+  fecha: string;
+  nombre: string;
+  cantidad: number;
+}
+
+export async function getActividadesDetalleDeQuincena(
+  quincenaId: string,
+): Promise<ActividadReporteDetalle[]> {
+  const r = await query<ActividadReporteDetalle>(
+    `SELECT a.empleada_id, a.fecha, c.nombre, COUNT(*)::int AS cantidad
+       FROM actividades a JOIN catalogo_actividades c ON c.id = a.catalogo_id
+      WHERE a.quincena_id = $1
+      GROUP BY a.empleada_id, a.fecha, c.nombre
+      ORDER BY a.fecha, c.nombre`,
+    [quincenaId],
   );
   return r.rows;
 }

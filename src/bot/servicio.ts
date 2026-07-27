@@ -32,6 +32,7 @@ import {
   getQuincenaById,
   getTurnosConEventosDeQuincena,
   getTurnosDeEmpleadaEnFecha,
+  getActividadesDetalleDeQuincena,
   agregadosTurnos,
   agregadosActividades,
   agregadosMovimientos,
@@ -270,8 +271,8 @@ export interface TurnoReporte {
   rangosPorTramo: string; // multilínea: "Ordinaria 6:00 AM–1:00 PM\nExtra diurna ..."
 }
 
-/** Enriquece un turno con los rangos de reloj por tramo (recalculados). */
-function aTurnoReporte(t: TurnoConEventos): TurnoReporte {
+/** Rangos de reloj por tramo de un turno (recalculados, multilínea). */
+function rangosPorTramoDe(t: TurnoConEventos): string {
   const entrada = parseSQLaDate(t.entrada_declarado);
   const salida = parseSQLaDate(t.salida_declarado);
   const rates = {
@@ -284,10 +285,15 @@ function aTurnoReporte(t: TurnoConEventos): TurnoReporte {
     recDominical: 0,
   } satisfies RatesConfig;
   const esDomFest = Number(t.desglose_tramos.dominical ?? 0) > 0;
-  const segs = segmentosDeTurno({ entrada, salida, rates, esDominicalOFestivo: esDomFest });
-  const rangosPorTramo = segs
+  return segmentosDeTurno({ entrada, salida, rates, esDominicalOFestivo: esDomFest })
     .map((s) => `${ETIQUETA_TRAMO[s.tramo]} ${formatoHora12(s.desde)}–${formatoHora12(s.hasta)}`)
     .join('\n');
+}
+
+/** Enriquece un turno con los rangos de reloj por tramo (recalculados). */
+function aTurnoReporte(t: TurnoConEventos): TurnoReporte {
+  const entrada = parseSQLaDate(t.entrada_declarado);
+  const salida = parseSQLaDate(t.salida_declarado);
   return {
     fecha: t.fecha,
     alias: t.alias,
@@ -297,7 +303,7 @@ function aTurnoReporte(t: TurnoConEventos): TurnoReporte {
     entrada: formatoHora12(entrada),
     salida: formatoHora12(salida),
     rangoTurno: `${formatoHora12(entrada)} – ${formatoHora12(salida)}`,
-    rangosPorTramo,
+    rangosPorTramo: rangosPorTramoDe(t),
   };
 }
 
@@ -305,6 +311,139 @@ function aTurnoReporte(t: TurnoConEventos): TurnoReporte {
 export async function turnosParaReporte(quincenaId: string): Promise<TurnoReporte[]> {
   const turnos = await getTurnosConEventosDeQuincena(quincenaId);
   return turnos.map(aTurnoReporte);
+}
+
+// ============================================================================
+// Reporte SEPARADO por empleada (sección 13.1): turnos + actividades del día
+// fusionados y listos para una hoja de Excel por persona. Solo agrupa/ordena
+// para presentación — no cambia ningún valor calculado.
+// ============================================================================
+
+export interface FilaReporteExcel {
+  fecha: string; // 'YYYY-MM-DD' (el Excel lo formatea a DD/MM/YYYY)
+  entrada: string; // '' en una fila de solo-actividad
+  salida: string;
+  horas: number | null; // total del turno; null (celda en blanco) si solo-actividad
+  ordinariaH: number | null;
+  extraDiurnaH: number | null;
+  extraDiurnaV: number | null;
+  extraNocturnaH: number | null;
+  extraNocturnaV: number | null;
+  dominicalH: number | null;
+  dominicalV: number | null;
+  actividad: string; // nombres del día (p.ej. "Rocco, 2 Gatas"), '' si ninguna
+  valorTurno: number | null; // valor_calculado; null si solo-actividad
+  rangosPorTramo: string;
+  soloActividad: boolean;
+}
+
+export interface TurnosEmpleadaReporte {
+  empleadaId: string;
+  alias: string;
+  filas: FilaReporteExcel[];
+  totalExtraHoras: number;
+  totalExtraValor: number;
+}
+
+const soloFecha = (f: string) => f.slice(0, 10);
+const toNum = (v: unknown) => Number(v ?? 0);
+const textoActividades = (items: { nombre: string; cantidad: number }[]) =>
+  items.map((a) => (a.cantidad > 1 ? `${a.cantidad} ${a.nombre}` : a.nombre)).join(', ');
+
+export async function turnosPorEmpleadaParaReporte(
+  quincenaId: string,
+): Promise<TurnosEmpleadaReporte[]> {
+  const [turnos, actividades, empleadas] = await Promise.all([
+    getTurnosConEventosDeQuincena(quincenaId),
+    getActividadesDetalleDeQuincena(quincenaId),
+    getEmpleadasActivas(),
+  ]);
+
+  return empleadas.map((e) => {
+    const misTurnos = turnos
+      .filter((t) => t.empleada_id === e.id)
+      .sort(
+        (a, b) =>
+          soloFecha(a.fecha).localeCompare(soloFecha(b.fecha)) ||
+          a.entrada_declarado.localeCompare(b.entrada_declarado),
+      );
+
+    // Actividades del día: fecha -> lista de {nombre, cantidad}.
+    const actPorDia = new Map<string, { nombre: string; cantidad: number }[]>();
+    for (const a of actividades) {
+      if (a.empleada_id !== e.id) continue;
+      const k = soloFecha(a.fecha);
+      const arr = actPorDia.get(k);
+      if (arr) arr.push({ nombre: a.nombre, cantidad: a.cantidad });
+      else actPorDia.set(k, [{ nombre: a.nombre, cantidad: a.cantidad }]);
+    }
+    const fechasConTurno = new Set(misTurnos.map((t) => soloFecha(t.fecha)));
+
+    const filas: FilaReporteExcel[] = [];
+    let totalExtraHoras = 0;
+    let totalExtraValor = 0;
+
+    // 1) Filas de turnos. La actividad del día se muestra solo en el primer turno
+    //    de esa fecha (evita que un turno partido la duplique visualmente).
+    const actMostradaEn = new Set<string>();
+    for (const t of misTurnos) {
+      const f = soloFecha(t.fecha);
+      const g = t.desglose_tramos ?? {};
+      const v = t.valor_tramos ?? {};
+      const eDiaH = toNum(g.extra_diurna);
+      const eNocH = toNum(g.extra_nocturna);
+      const domH = toNum(g.dominical);
+      const eDiaV = Math.round(toNum(v.extra_diurna));
+      const eNocV = Math.round(toNum(v.extra_nocturna));
+      const domV = Math.round(toNum(v.dominical));
+      totalExtraHoras += eDiaH + eNocH + domH;
+      totalExtraValor += eDiaV + eNocV + domV;
+      const mostrarAct = actPorDia.has(f) && !actMostradaEn.has(f);
+      if (mostrarAct) actMostradaEn.add(f);
+      filas.push({
+        fecha: f,
+        entrada: formatoHora12(parseSQLaDate(t.entrada_declarado)),
+        salida: formatoHora12(parseSQLaDate(t.salida_declarado)),
+        horas: toNum(t.horas_totales),
+        ordinariaH: toNum(g.ordinaria),
+        extraDiurnaH: eDiaH,
+        extraDiurnaV: eDiaV,
+        extraNocturnaH: eNocH,
+        extraNocturnaV: eNocV,
+        dominicalH: domH,
+        dominicalV: domV,
+        actividad: mostrarAct ? textoActividades(actPorDia.get(f)!) : '',
+        valorTurno: t.valor_calculado,
+        rangosPorTramo: rangosPorTramoDe(t),
+        soloActividad: false,
+      });
+    }
+
+    // 2) Días con actividad pero SIN ningún turno -> fila con horas en blanco.
+    for (const [f, items] of actPorDia) {
+      if (fechasConTurno.has(f)) continue;
+      filas.push({
+        fecha: f,
+        entrada: '',
+        salida: '',
+        horas: null,
+        ordinariaH: null,
+        extraDiurnaH: null,
+        extraDiurnaV: null,
+        extraNocturnaH: null,
+        extraNocturnaV: null,
+        dominicalH: null,
+        dominicalV: null,
+        actividad: textoActividades(items),
+        valorTurno: null,
+        rangosPorTramo: '',
+        soloActividad: true,
+      });
+    }
+
+    filas.sort((a, b) => a.fecha.localeCompare(b.fecha)); // estable: mantiene el orden por entrada dentro del día
+    return { empleadaId: e.id, alias: e.alias, filas, totalExtraHoras, totalExtraValor };
+  });
 }
 
 /**

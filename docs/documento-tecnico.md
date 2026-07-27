@@ -462,6 +462,29 @@ tipo, la hoja debe mostrar el rango de reloj de cada tramo — hora de entrada
 y salida del turno, y de qué hora a qué hora corresponde cada tramo
 (ordinaria, extra diurna, extra nocturna, dominical/festivo). Estos rangos
 **se recalculan al generar el reporte** a partir de la entrada/salida real y
+
+### 13.1 Estructura del Excel (legibilidad por empleada — pedido de Nati)
+
+- **Separación por empleada:** en vez de una sola hoja de turnos con Nena y
+  Maye mezcladas por fecha, el libro separa el detalle diario en hojas
+  independientes: **"Turnos — Nena"** y **"Turnos — Maye"**. Lo mismo aplica
+  a **"Movimientos — Nena"** / **"Movimientos — Maye"** (préstamos y bonos).
+  La hoja **"Resumen"** se mantiene combinada — es la vista comparativa de
+  ambas, y ahí sí tiene sentido verlas una al lado de la otra.
+- **Columna de actividad:** cada hoja de turnos gana una columna
+  **"Actividad"** que muestra el nombre de la actividad extra (Rococó,
+  Gatas, ambas) registrada ese mismo día para esa empleada. Si un día tiene
+  actividad pero ningún turno registrado, se agrega igual una fila para esa
+  fecha (columnas de horas en blanco) para no perder el dato.
+- **Resaltado de horas extra:** las celdas de horas y valor de extra diurna,
+  extra nocturna y dominical/festivo llevan un color de relleno distinto al
+  de las horas ordinarias, para que salten a la vista de inmediato. Cada
+  hoja de turnos cierra con una fila de **total de horas extra** (horas y
+  valor en pesos) para esa empleada en el período.
+- **Pulido visual general:** encabezados en negrita, ancho de columna
+  ajustado al contenido, formato de moneda consistente, bordes sutiles.
+  Cambio de presentación únicamente — ningún valor calculado cambia.
+
 las mismas reglas del motor de clasificación (sección 5) — no se guardan
 duplicados en la base de datos, para no tener dos fuentes de verdad que
 puedan desincronizarse. Notación siempre en formato 12 horas + AM/PM (ver

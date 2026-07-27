@@ -63,6 +63,7 @@ import {
   turnoEnConflicto,
   resumenParaReporte,
   turnosParaReporte,
+  turnosPorEmpleadaParaReporte,
   type ConflictoTurno,
   type ResultadoMaterializacion,
 } from './servicio.ts';
@@ -1367,12 +1368,13 @@ bot.action(/^rate:cancel:(.+)$/, async (ctx) => {
 
 // ---------- Reportes bajo demanda (sección 13) ----------
 async function enviarReportes(quincenaId: string, formato: 'excel' | 'pdf' | 'ambos'): Promise<void> {
-  const [datosBase, turnos, movimientos] = await Promise.all([
+  const [datosBase, turnos, turnosPorEmpleada, movimientos] = await Promise.all([
     resumenParaReporte(quincenaId),
     turnosParaReporte(quincenaId),
+    turnosPorEmpleadaParaReporte(quincenaId),
     getMovimientosDeQuincena(quincenaId),
   ]);
-  const datos = { ...datosBase, turnos, movimientos };
+  const datos = { ...datosBase, turnos, turnosPorEmpleada, movimientos };
   const { resumen, definitivo, generadoEn } = datosBase;
   const marca = definitivo ? 'definitivo' : `parcial (al ${generadoEn})`;
 

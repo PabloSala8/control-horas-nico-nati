@@ -585,3 +585,91 @@ editables sin tocar código porque son filas de `config_rates`):*
 - Sigue abierto: estado en memoria volátil (reinicio pierde solicitudes/propuestas
   a medio resolver), quincena ajustable en préstamos §9.2, catálogo de motivos de
   bonos §10, turnos que cruzan medianoche.
+
+## Sesión 7 — Despliegue a producción en Railway · FASE 1 EN PRODUCCIÓN
+
+**Construido:**
+- Proyecto en Railway creado (servicio del bot + Postgres), variables de entorno
+  configuradas.
+- `migrate` + `seed` corridos contra la base de Railway **desde local** usando
+  `DATABASE_PUBLIC_URL` (la URL pública del Postgres de Railway; la interna
+  `DATABASE_URL` solo resuelve dentro del proyecto). Schema aplicado y datos de
+  referencia sembrados. Confirma en la práctica el flujo de la Sesión 6:
+  `DATABASE_URL=<url-publica> npm run migrate` apunta a Railway sin tocar código.
+- Smoke test real en Telegram contra producción: Nena registró un turno real, y el
+  cierre de quincena + generación de Excel funcionaron en prod (el fix de
+  `sendDocument` con fetch nativo de la Sesión 4 se sostiene en el entorno real).
+
+**Decisiones tomadas:**
+- `engines.node` fijado a `26.x` para que producción corra el MISMO Node mayor que
+  desarrollo — donde se verificó el workaround de `sendDocument` (fetch/FormData
+  nativos, Sesión 4). Aclaración: fijar a 26.x NO evita el bug de Node 26 (ese lo
+  resuelve el código); lo que evita es que Railway auto-seleccione otra versión de
+  Node y reintroduzca sorpresas de compatibilidad.
+
+**A tener en cuenta para el arranque real:**
+- El smoke test **cerró una quincena real** en la base de producción (snapshot
+  congelado). Si era solo prueba, conviene resetear antes del arranque real —
+  `borrar base de datos` desde el grupo de admins, o `DATABASE_URL=<url-publica>
+  npm run reset` contra Railway — para no arrastrar datos de test.
+- Recordar que `npm run seed` en Railway ya aplicó el rename Rococó→Rocco y los
+  datos de referencia; no re-sembrar destruye nada (es idempotente), pero un
+  `reset` sí re-corre migrate+seed.
+
+## Sesión 8 — Excel por empleada (sección 13.1): hojas separadas, columna de actividad, resaltado de extras
+
+**Construido (solo presentación del Excel — motor, modelo y lógica del bot intactos):**
+- Hoja **"Resumen" combinada** (mismos datos, con pulido). El detalle diario se
+  separó en **"Turnos — Nena"** / **"Turnos — Maye"** y **"Movimientos — Nena"** /
+  **"Movimientos — Maye"**, cada una solo con lo de esa persona y ordenada por fecha.
+- Columna **"Actividad"** en cada hoja de turnos (nombre de Rocco/Gatas del día).
+  Un día con actividad y sin turno genera igual una fila con las columnas de horas
+  en blanco (no se pierde el dato).
+- **Resaltado de extras:** las celdas de horas y valor de extra diurna, extra
+  nocturna y dominical/festivo llevan relleno distinto al de ordinaria; se resalta
+  solo el tramo que tiene horas, para que salte a la vista. Cada hoja de turnos
+  cierra con una fila de **total de horas extra** (horas y valor en pesos).
+- **Pulido:** encabezados en negrita sobre fondo oscuro, anchos por columna
+  ajustados, moneda `"$"#,##0` consistente, horas `0.##`, bordes finos, títulos con
+  marca Parcial/Definitivo.
+
+**Cómo se alimentó (lo estrictamente necesario, sin lógica de negocio):**
+- `queries.ts` (solo lectura): se agregó `valor_tramos` al SELECT de turnos-con-
+  eventos (columna ya existente) para desglosar el valor de los extras; nuevo
+  `getActividadesDetalleDeQuincena` (actividades por empleada/día/nombre).
+- `servicio.ts`: nuevo `turnosPorEmpleadaParaReporte(quincenaId)` que devuelve los
+  datos YA separados por empleada — turnos + actividades del día fusionadas (la
+  actividad del día se muestra en el primer turno de esa fecha; los días de solo-
+  actividad generan una fila) + totales de extras. Se extrajo `rangosPorTramoDe`
+  de `aTurnoReporte` para reutilizarlo SIN cambiar el tipo `TurnoReporte` (el PDF
+  sigue igual).
+- `index.ts`: una línea en `enviarReportes` para incluir `turnosPorEmpleada` en
+  `datos` (ensamblaje del reporte, no lógica de negocio). `DatosReporte` gana el
+  campo; el PDF lo ignora.
+
+**Decisiones:**
+- El total de horas extra por hoja se calcula sobre los MISMOS turnos que muestra
+  la hoja (live), para que la hoja sea internamente consistente. En una quincena
+  cerrada con correcciones post-cierre ese total (live) puede diferir del
+  "Extras ($)" del Resumen (que sale del snapshot congelado) — es la misma
+  distinción live/congelado que ya define §18.5.
+- La actividad de un día se muestra solo en el primer turno de esa fecha (evita
+  duplicarla visualmente en turnos partidos).
+- Se descartó una fila "Neto" que se probó en Movimientos por confusión de signos;
+  el neto ya vive en el Resumen.
+
+**Validación:**
+- Smoke test sin DB (en scratchpad): genera el `.xlsx` con datos de ejemplo
+  (festivo dominical, turno con extra diurna + Rocco, día de solo-actividad, turno
+  partido, turno nocturno) y lo re-abre para volcar celdas. Verificado: 5 hojas
+  correctas, separación por empleada, columna Actividad, fila de solo-actividad en
+  blanco, resaltado solo en tramos con valor, totales de extras, y a nivel de celda
+  `"$"#,##0` en pesos, `0.##` en horas, encabezado con fondo/negrita/borde.
+- `npm run test:core`: 64/64 (no se tocó /core). Typecheck limpio.
+
+**Pendiente:**
+- Confirmar abriendo el `.xlsx` en Excel/Numbers; opción de regenerarlo contra la
+  quincena cerrada de Railway en modo lectura (`DATABASE_PUBLIC_URL`) para verlo con
+  datos reales.
+- El PDF (§13) sigue con el detalle combinado (no era alcance de esta sesión); si se
+  quisiera la misma separación por empleada, es un cambio análogo en `pdf.ts`.
