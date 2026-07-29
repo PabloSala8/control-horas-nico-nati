@@ -745,3 +745,87 @@ confirmación de golpe.
 **Pendiente (fix de fondo, no hecho):** persistir las confirmaciones pendientes
 (tabla / TTL) para que sobrevivan también a un redeploy real a mitad de un flujo;
 y confirmar **Scale = 1 instancia** en Railway (2 réplicas → 409 permanente).
+
+## Sesión 11 — Registro de incidentes de operación en producción (Railway) y aprendizajes
+
+Consolidación de los sustos que salieron operando el bot en producción. No son
+cambios de código nuevos (salvo lo ya anotado en Sesión 10) — es registro para no
+repetirlos.
+
+### 1. Los deploys no reflejaban los cambios / "Deployment queued due to upstream GitHub issues"
+- **Síntoma:** tras `git push` + redeploy, el bot seguía mandando el Excel viejo; en
+  otra ocasión un deploy quedó atascado en "Queued" con ese mensaje, aunque GitHub y
+  Railway estaban ambos 100% operativos (verificado en sus status pages).
+- **Causa:** el proyecto en Railway NO está conectado directo a la cuenta de GitHub.
+  Tiene un **"Source Repo" (mirror interno de Railway) separado del "Upstream Repo"**
+  (el repo real). El mirror **no se sincroniza solo** con cada push; hay que
+  actualizarlo a mano (Settings → Source → botón de actualizar upstream). Los
+  redeploys reconstruían el mirror **viejo**.
+- **Fix inmediato:** sincronizar el upstream a mano → esperar el correo → disparar un
+  deploy nuevo → confirmar en logs el commit esperado.
+- **Prevención (recomendada, no hecha):** Disconnect del Source Repo y reconectar el
+  servicio directo a GitHub por la app de Railway → auto-deploy en cada push, sin el
+  paso manual.
+
+### 2. (Confirmado, no es bug) Los reportes de quincena cerrada se REGENERAN, no se cachean
+Al pedir Excel/PDF de una quincena cerrada, el archivo se **regenera desde cero** con
+el código actual (`excel.ts`/`servicio.ts`); solo los NÚMEROS del Resumen salen
+congelados del snapshot. No se guarda ningún `.xlsx`. Correcto y consistente con
+§18.5. **Implicación:** un formato viejo del reporte nunca es cache del bot → siempre
+significa código viejo desplegado (ver #1).
+
+### 3. Botones de admin no hacían NADA ("Loading…" infinito) tras el grupo de admin volverse supergrupo
+- **Síntoma:** los comandos de **texto** de admin (ver rates, "le presté 200…")
+  funcionaban y mostraban su vista previa, pero al tocar **Confirmar / Sí / Cancelar**
+  de cualquier flujo de admin no pasaba nada (spinner infinito). Entré/Salí de las
+  empleadas sí funcionaban.
+- **Causa raíz:** el grupo de admin TAMBIÉN migró a supergrupo → su chat_id cambió
+  (`-100…`). Se actualizó `ADMIN_CHAT_ID` en env, pero la tabla `admins` en la DB
+  seguía con el chat_id **viejo**. Los **botones** de admin pasan por `esChatAdmin()`,
+  que además del match contra env hace un chequeo en DB:
+  `getAdminPorChat(chatId) !== null` (`SELECT … FROM admins WHERE chat_id_admin = $1`).
+  Con el id nuevo no había fila → `esChatAdmin` devolvía `false` → los handlers hacían
+  `return ctx.answerCbQuery()` sin ejecutar nada. Los comandos de **texto** funcionaban
+  porque `manejarTextoAdmin` compara directo contra `config.adminChatId` (env), sin
+  tocar la DB. Entré/Salí funcionaban porque usan la tabla `empleadas` (ya actualizada
+  en Sesión 9).
+- **Fix (SQL, una vez contra Railway):**
+  ```sql
+  UPDATE admins SET chat_id_admin = -1004323883053;   -- Nico y Nati, mismo grupo de admin
+  ```
+  (o `DATABASE_URL=<public> npm run seed` — el seed de Sesión 9 también sincroniza
+  `chat_id_admin` desde env.)
+- **Aprendizaje / deuda:** la Sesión 9 corrigió el chat_id en `empleadas` pero olvidó
+  `admins`. Y hay una **inconsistencia de diseño**: el texto de admin confía solo en
+  env, pero los callbacks exigen además la fila en DB. Si la DB queda desincronizada:
+  "texto sí, botones no". Candidato a simplificar `esChatAdmin` (¿hace falta el chequeo
+  en DB?) o a garantizar la sincronía siempre vía seed en el despliegue.
+
+### 4. Conectarse a la DB de Railway desde local
+Para migrate/seed/SQL desde la máquina local se usa **`DATABASE_PUBLIC_URL`** (host
+`…proxy.rlwy.net`), NO la `DATABASE_URL` interna (`…railway.internal`, que solo
+resuelve dentro de la red de Railway). Está en Variables del servicio **Postgres**.
+
+### 5. Modelo "identificación por CHAT, no por usuario" — implicaciones operativas
+- El bot identifica el contexto por el **chat_id del grupo**, nunca por el user que
+  escribe. En un grupo de empleada, CUALQUIER mensaje (de la empleada o de quien sea)
+  se procesa como de esa empleada.
+- **Migración basic→supergroup = cambio de chat_id.** Ya pasó en los tres grupos (ids
+  `-100…`). Agregar/quitar miembros de un grupo que YA es supergrupo NO cambia el id.
+- **El owner (Pablo) puede salirse de los grupos sin afectar nada:** no está
+  referenciado en el bot; los admins del bot son Nico/Nati (tabla `admins`). Conviene
+  dejar un admin de Telegram (Nati/Nico) en cada grupo para poder re-agregar el bot si
+  hiciera falta.
+- **Privacidad del dinero intacta:** el bot solo envía pesos al grupo de admin (por
+  chat_id), nunca a un grupo de empleada, sin importar quién esté adentro. Nati puede
+  estar en el grupo de una empleada y solo verá horas.
+- **Caveat con un admin presente en un grupo de empleada:** si escribe algo con pista
+  de hora ("a las 3", "salí…"), el bot lo atribuye a la EMPLEADA. Regla operativa: las
+  correcciones se hacen desde el grupo de admin; en los grupos de empleada no teclear
+  horas/marcaciones.
+
+**Recomendaciones abiertas de esta sesión:**
+- Reconectar Railway directo a GitHub (elimina el paso manual de sincronizar upstream, #1).
+- Confirmar Scale = 1 réplica en Railway (Sesión 10).
+- Simplificar/robustecer `esChatAdmin` para que no vuelva a pasar "texto sí, botones no" (#3).
+- Fix de fondo del estado en memoria (persistir confirmaciones) sigue abierto (Sesión 10).
