@@ -507,7 +507,7 @@ async function registrarPropuestaHora(
   if (tipo === 'salida' && bloque) {
     const entradaDate = parseSQLaDate(bloque.momento_declarado);
     try {
-      const { resultado } = await clasificarPar(entradaDate, momentoDeclarado);
+      const { resultado } = await clasificarPar(entradaDate, momentoDeclarado, empleada.alias);
       await enviarAdmins(
         F.msgConfirmacionTurno({ alias: empleada.alias, entrada: entradaDate, salida: momentoDeclarado, r: resultado }),
         tecladoAprobacion(evento.id),
@@ -889,7 +889,7 @@ async function manejarAwaitingAdmin(texto: string): Promise<void> {
     let resultado: ResultadoClasificacion;
     let ratesId: string;
     try {
-      ({ resultado, ratesId } = await clasificarPar(entrada, salida));
+      ({ resultado, ratesId } = await clasificarPar(entrada, salida, st.alias));
     } catch {
       return enviarAdmins('Ese horario no es válido: la salida debe ser después de la entrada.');
     }
@@ -940,7 +940,7 @@ async function manejarAwaitingAdmin(texto: string): Promise<void> {
     let resultado: ResultadoClasificacion;
     let ratesId: string;
     try {
-      ({ resultado, ratesId } = await clasificarPar(entrada, salida));
+      ({ resultado, ratesId } = await clasificarPar(entrada, salida, t.alias));
     } catch {
       return enviarAdmins('Ese horario no es válido: la salida debe ser después de la entrada.');
     }

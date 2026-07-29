@@ -22,12 +22,14 @@ import {
   intervalosSeCruzan,
 } from '../core/tiempo.ts';
 import { salarioBaseQuincena, calcularNetoPreliminar } from '../core/quincena.ts';
+import { ventanaParaFecha } from '../core/horarios.ts';
 import {
   getRatesVigentes,
   esDominicalOFestivo,
   ensureQuincenaVigente,
   crearTurno,
   getBloqueAbierto,
+  getEmpleadaPorId,
   getEmpleadasActivas,
   getQuincenaById,
   getTurnosConEventosDeQuincena,
@@ -41,27 +43,21 @@ import {
   type TurnoConEventos,
 } from '../db/queries.ts';
 
-/** Clasifica un par entrada/salida SIN persistir (para previsualizar impacto). */
+/**
+ * Clasifica un par entrada/salida SIN persistir (para previsualizar impacto).
+ * `alias` de la empleada define su ventana ordinaria de ese día (ver horarios.ts).
+ */
 export async function clasificarPar(
   entrada: Date,
   salida: Date,
+  alias: string,
 ): Promise<{ resultado: ResultadoClasificacion; ratesId: string }> {
   const fecha = fechaISO(entrada);
   const rates = await getRatesVigentes(fecha);
   const domFest = await esDominicalOFestivo(fecha, diaSemana(entrada));
-  const resultado = clasificarTurno({ entrada, salida, rates, esDominicalOFestivo: domFest });
+  const ventanaOrdinaria = ventanaParaFecha(alias, entrada);
+  const resultado = clasificarTurno({ entrada, salida, rates, esDominicalOFestivo: domFest, ventanaOrdinaria });
   return { resultado, ratesId: rates.ratesId };
-}
-
-/** Igual que `clasificarPar` pero tomando los eventos persistidos. */
-export async function clasificarDesdeEventos(
-  entrada: Evento,
-  salida: Evento,
-): Promise<{ resultado: ResultadoClasificacion; ratesId: string }> {
-  return clasificarPar(
-    parseSQLaDate(entrada.momento_declarado),
-    parseSQLaDate(salida.momento_declarado),
-  );
 }
 
 /**
@@ -123,7 +119,8 @@ export async function materializarTurno(
   const conflicto = await turnoEnConflicto(empleadaId, entradaDate, salidaDate);
   if (conflicto) return { ok: false, conflicto };
 
-  const { resultado, ratesId } = await clasificarPar(entradaDate, salidaDate);
+  const emp = await getEmpleadaPorId(empleadaId);
+  const { resultado, ratesId } = await clasificarPar(entradaDate, salidaDate, emp?.alias ?? '');
   const quincenaId = await ensureQuincenaVigente(fecha);
 
   const turno = await crearTurno({
@@ -285,7 +282,8 @@ function rangosPorTramoDe(t: TurnoConEventos): string {
     recDominical: 0,
   } satisfies RatesConfig;
   const esDomFest = Number(t.desglose_tramos.dominical ?? 0) > 0;
-  return segmentosDeTurno({ entrada, salida, rates, esDominicalOFestivo: esDomFest })
+  const ventanaOrdinaria = ventanaParaFecha(t.alias, entrada);
+  return segmentosDeTurno({ entrada, salida, rates, esDominicalOFestivo: esDomFest, ventanaOrdinaria })
     .map((s) => `${ETIQUETA_TRAMO[s.tramo]} ${formatoHora12(s.desde)}–${formatoHora12(s.hasta)}`)
     .join('\n');
 }

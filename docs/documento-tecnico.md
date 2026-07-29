@@ -213,17 +213,40 @@ mano.
 Dado un turno (entrada + salida confirmadas), el motor:
 
 1. Calcula horas totales del turno.
-2. Determina si la fecha es domingo o está en `festivos` → si sí, todo el
-   turno se clasifica como recargo dominical/festivo, no como hora extra
-   ordinaria.
-3. Si no es festivo: parte el turno en tramos usando `inicio_nocturno` (hoy
-   19:00) como corte entre diurno y nocturno.
-4. Dentro de cada tramo, separa lo que cae dentro de la jornada ordinaria
-   (proporcional a 42h/semana) de lo que es adicional (extra).
-5. Aplica los recargos de `config_rates` vigentes a la fecha del turno sobre
+2. Determina si la fecha es domingo o está en `festivos` → si sí, **todo** el
+   turno se clasifica como recargo dominical/festivo (manda sobre la ventana
+   ordinaria), no como hora extra ordinaria.
+3. Si no es festivo: son **ordinarias** las horas trabajadas DENTRO de la
+   ventana de reloj que tiene esa empleada ese día de la semana (ver 5.1). Lo
+   trabajado **fuera** de la ventana —o en un día sin ventana— es **extra**,
+   clasificada como diurna o nocturna según el corte de `inicio_nocturno` (hoy
+   19:00). La hora ordinaria nunca lleva recargo nocturno.
+4. Aplica los recargos de `config_rates` vigentes a la fecha del turno sobre
    cada tramo.
-6. Guarda el desglose completo en `desglose_tramos` y el total en
+5. Guarda el desglose completo en `desglose_tramos` y el total en
    `valor_calculado`.
+
+### 5.1 Ventanas ordinarias por empleada (horarios reales)
+
+Corregido tras el primer día de prueba: la jornada ordinaria NO es un umbral de
+horas por turno, sino una **ventana de reloj fija por empleada y día de la
+semana**. Cada semana suma 42 horas ordinarias.
+
+| | Lun–Jue | Vie | Sáb | Dom |
+|---|---|---|---|---|
+| **Maye** | 7:00–16:00 (9h) | 7:00–13:00 (6h) | — (todo extra) | — |
+| **Nena** | 7:00–15:00 (8h) | 7:00–15:00 (8h) | 7:00–09:00 (2h) | — |
+
+- Ordinaria = intersección de lo trabajado con la ventana. Si llega tarde o sale
+  temprano, simplemente hace menos ordinarias (no genera extra); si llega antes o
+  se queda después, esos minutos de afuera son extra.
+- Los horarios viven **hardcodeados** en `src/core/horarios.ts` (dato puro,
+  editable con un cambio de código + redeploy). Decisión deliberada: cambian rara
+  vez y así no hay migración ni riesgo en la base. Si a futuro se quieren editables
+  sin desplegar, se mueven a una tabla versionada como `config_rates`.
+- Antes de esta corrección el motor usaba un umbral diario derivado del divisor
+  (`divisor/30` ≈ 7h/día); se reemplazó por estas ventanas reales. El `divisor`
+  sigue usándose solo para el valor de la hora ordinaria (`salario/divisor`).
 
 **Nota deliberada:** no se está optimizando este motor para blindaje legal
 frente al Ministerio de Trabajo (Nico y Nati fueron explícitos: no es

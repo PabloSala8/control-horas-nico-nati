@@ -11,6 +11,7 @@
  */
 
 import { minutoDelDia, horaAminutos } from './tiempo.ts';
+import type { VentanaOrdinaria } from './horarios.ts';
 
 /** Configuración de rates vigente (una fila de `config_rates`). */
 export interface RatesConfig {
@@ -36,28 +37,12 @@ export interface ResultadoClasificacion {
   valorCalculado: number; // pesos, redondeado
   detalle: {
     valorHoraOrdinaria: number;
-    jornadaOrdinariaDiaria: number; // horas ordinarias/día usadas como umbral
     esDominicalOFestivo: boolean;
     valorPorTramo: DesgloseTramos; // pesos aportados por cada bucket
   };
 }
 
 const redondear2 = (h: number) => Math.round(h * 100) / 100;
-
-/**
- * La jornada ordinaria diaria (umbral a partir del cual las horas de un turno
- * cuentan como extra) se deriva del divisor mensual: divisor / 30.
- * Con divisor 210 -> 7 h/día, consistente con 42 h/semana ÷ 6 días.
- *
- * DECISIÓN DE IMPLEMENTACIÓN (anotada en la bitácora): el documento técnico
- * fija el divisor mensual (210) pero no el umbral diario. Se deriva aquí de
- * forma transparente y editable vía `divisor_horas`, coherente con la
- * filosofía del documento (los rates mandan, no el código). Pendiente de
- * confirmación por Pablo.
- */
-export function jornadaOrdinariaDiaria(rates: RatesConfig): number {
-  return rates.divisorHoras / 30;
-}
 
 /** Valor de la hora ordinaria: siempre derivado, nunca guardado fijo. */
 export function valorHoraOrdinaria(rates: RatesConfig): number {
@@ -68,17 +53,25 @@ export function valorHoraOrdinaria(rates: RatesConfig): number {
  * Clasifica un turno (entrada + salida confirmadas) en tramos y calcula su
  * valor en pesos.
  *
+ * Regla de ordinaria/extra (sección 5): son ordinarias las horas trabajadas
+ * DENTRO de la ventana de reloj de esa empleada ese día (`ventanaOrdinaria`);
+ * lo trabajado fuera de la ventana —o en un día sin ventana (`null`)— es extra
+ * (diurna/nocturna según el corte de `inicioNocturno`).
+ *
  * @param esDominicalOFestivo lo determina el llamador (getUTCDay()==0 o la
- *   fecha está en la tabla `festivos`). Se pasa por parámetro para mantener el
- *   motor puro y sin dependencia de la DB.
+ *   fecha está en la tabla `festivos`). Si es true, TODO el turno es dominical
+ *   (manda sobre la ventana). Se pasa por parámetro para mantener el motor puro.
+ * @param ventanaOrdinaria la ventana ordinaria de la empleada para la fecha del
+ *   turno, o `null` si ese día no tiene jornada ordinaria (todo extra).
  */
 export function clasificarTurno(params: {
   entrada: Date;
   salida: Date;
   rates: RatesConfig;
   esDominicalOFestivo: boolean;
+  ventanaOrdinaria: VentanaOrdinaria | null;
 }): ResultadoClasificacion {
-  const { entrada, salida, rates, esDominicalOFestivo } = params;
+  const { entrada, salida, rates, esDominicalOFestivo, ventanaOrdinaria } = params;
 
   const totalMin = Math.round((salida.getTime() - entrada.getTime()) / 60_000);
   if (totalMin <= 0) {
@@ -86,7 +79,6 @@ export function clasificarTurno(params: {
   }
 
   const vHora = valorHoraOrdinaria(rates);
-  const jornadaDiaria = jornadaOrdinariaDiaria(rates);
 
   const desglose: DesgloseTramos = {
     ordinaria: 0,
@@ -107,21 +99,21 @@ export function clasificarTurno(params: {
       valorCalculado: Math.round(valorTramo),
       detalle: {
         valorHoraOrdinaria: vHora,
-        jornadaOrdinariaDiaria: jornadaDiaria,
         esDominicalOFestivo: true,
         valorPorTramo: { ordinaria: 0, extra_diurna: 0, extra_nocturna: 0, dominical: Math.round(valorTramo) },
       },
     };
   }
 
-  // Día ordinario: recorremos minuto a minuto. Los primeros `jornadaDiaria`
-  // horas del turno son ordinarias; lo que exceda es extra, clasificado como
-  // diurno/nocturno según la hora de reloj de ese minuto (corte en
-  // `inicio_nocturno`). El recargo nocturno del modelo aplica solo a la hora
-  // EXTRA nocturna (config no tiene recargo nocturno sobre la ordinaria).
+  // Día ordinario: recorremos minuto a minuto. Un minuto es ordinario si su hora
+  // de reloj cae DENTRO de la ventana [desde, hasta) de la empleada ese día; si
+  // no (o no hay ventana), es extra, clasificado como diurno/nocturno según el
+  // corte de `inicio_nocturno`. El recargo nocturno aplica solo a la hora EXTRA
+  // nocturna (la ordinaria nunca lleva recargo nocturno en este modelo).
   const inicioNocturnoMin = horaAminutos(rates.inicioNocturno);
-  const umbralOrdinarioMin = jornadaDiaria * 60;
   const inicioMinDia = minutoDelDia(entrada);
+  const ventDesdeMin = ventanaOrdinaria ? horaAminutos(ventanaOrdinaria.desde) : -1;
+  const ventHastaMin = ventanaOrdinaria ? horaAminutos(ventanaOrdinaria.hasta) : -1;
 
   let minOrdinaria = 0;
   let minExtraDiurna = 0;
@@ -129,10 +121,10 @@ export function clasificarTurno(params: {
 
   for (let i = 0; i < totalMin; i++) {
     const clockMin = (inicioMinDia + i) % 1440;
-    const esNocturno = clockMin >= inicioNocturnoMin;
-    if (i < umbralOrdinarioMin) {
+    const dentroVentana = ventanaOrdinaria !== null && clockMin >= ventDesdeMin && clockMin < ventHastaMin;
+    if (dentroVentana) {
       minOrdinaria++;
-    } else if (esNocturno) {
+    } else if (clockMin >= inicioNocturnoMin) {
       minExtraNocturna++;
     } else {
       minExtraDiurna++;
@@ -154,7 +146,6 @@ export function clasificarTurno(params: {
     valorCalculado,
     detalle: {
       valorHoraOrdinaria: vHora,
-      jornadaOrdinariaDiaria: jornadaDiaria,
       esDominicalOFestivo: false,
       valorPorTramo: {
         ordinaria: Math.round(valOrdinaria),
@@ -187,8 +178,9 @@ export function segmentosDeTurno(params: {
   salida: Date;
   rates: RatesConfig;
   esDominicalOFestivo: boolean;
+  ventanaOrdinaria: VentanaOrdinaria | null;
 }): SegmentoTramo[] {
-  const { entrada, salida, rates, esDominicalOFestivo } = params;
+  const { entrada, salida, rates, esDominicalOFestivo, ventanaOrdinaria } = params;
   const totalMin = Math.round((salida.getTime() - entrada.getTime()) / 60_000);
   if (totalMin <= 0) return [];
 
@@ -200,12 +192,13 @@ export function segmentosDeTurno(params: {
   }
 
   const inicioNocturnoMin = horaAminutos(rates.inicioNocturno);
-  const umbralOrdinarioMin = jornadaOrdinariaDiaria(rates) * 60;
   const inicioMinDia = minutoDelDia(entrada);
+  const ventDesdeMin = ventanaOrdinaria ? horaAminutos(ventanaOrdinaria.desde) : -1;
+  const ventHastaMin = ventanaOrdinaria ? horaAminutos(ventanaOrdinaria.hasta) : -1;
 
   const bucketDe = (i: number): NombreTramo => {
-    if (i < umbralOrdinarioMin) return 'ordinaria';
     const clockMin = (inicioMinDia + i) % 1440;
+    if (ventanaOrdinaria !== null && clockMin >= ventDesdeMin && clockMin < ventHastaMin) return 'ordinaria';
     return clockMin >= inicioNocturnoMin ? 'extra_nocturna' : 'extra_diurna';
   };
 

@@ -829,3 +829,53 @@ resuelve dentro de la red de Railway). Está en Variables del servicio **Postgre
 - Confirmar Scale = 1 réplica en Railway (Sesión 10).
 - Simplificar/robustecer `esChatAdmin` para que no vuelva a pasar "texto sí, botones no" (#3).
 - Fix de fondo del estado en memoria (persistir confirmaciones) sigue abierto (Sesión 10).
+
+## Sesión 12 — Horas ordinarias por ventana de reloj real (corrección post primer día)
+
+**Motivo:** tras el primer día de prueba, Pablo corrigió la regla de horas
+ordinarias. NO es un umbral de horas por turno (antes: `divisor/30` ≈ 7h/día),
+sino una **ventana de reloj fija por empleada y día de la semana** (42h/semana):
+- **Maye:** lun–jue 7:00–16:00 (9h), vie 7:00–13:00 (6h). Sáb/dom: todo extra.
+- **Nena:** lun–vie 7:00–15:00 (8h), sáb 7:00–09:00 (2h). Dom: todo extra.
+Ordinaria = lo trabajado dentro de la ventana; fuera de la ventana (o día sin
+ventana) = extra. Domingo/festivo sigue mandando: todo dominical (100%).
+
+**Construido (solo `/core` + threading, sin tocar dinero ni modelo de datos):**
+- **`src/core/horarios.ts`** (nuevo): los dos horarios como dato PURO, keyed por
+  alias (estable entre reseeds), + `ventanaParaFecha(alias, fecha)`. Hardcodeado a
+  propósito → sin migración, sin riesgo en DB; cambiarlos = editar + redeploy.
+- **`src/core/clasificador.ts`:** `clasificarTurno` y `segmentosDeTurno` reciben
+  `ventanaOrdinaria: VentanaOrdinaria | null`. La decisión ordinaria↔extra pasó de
+  "primeras N horas del turno" (umbral por minutos transcurridos) a "hora de reloj
+  dentro de `[desde, hasta)`". Se eliminó `jornadaOrdinariaDiaria` (nadie externo la
+  leía) y el campo `detalle.jornadaOrdinariaDiaria`. Dominical/festivo y los
+  recargos NO cambiaron.
+- **`src/bot/servicio.ts`:** `clasificarPar(entrada, salida, alias)` resuelve la
+  ventana; `materializarTurno` obtiene el alias con `getEmpleadaPorId`; el reporte
+  (`rangosPorTramoDe`) usa `t.alias`. Se quitó `clasificarDesdeEventos` (sin uso).
+- **`src/bot/index.ts`:** las 3 llamadas a `clasificarPar` pasan el alias
+  (registrarPropuestaHora, reprevisar-salida, corregir-turno).
+- **Tests:** reescritos `clasificador.test.ts` y `segmentosDeTurno.test.ts` para la
+  regla de ventanas; nuevo `horarios.test.ts` con los horarios reales
+  (auto-verifica el día de la semana de las fechas de referencia). **70/70 en verde.**
+
+**Decisiones / notas:**
+- El `divisor` (210) ya solo sirve para el valor de la hora ordinaria
+  (`salario/210 = $8.338`); ya no deriva ningún umbral.
+- El valor del turno (`valor_calculado`) incluye la parte ordinaria, pero al NETO
+  solo suma `valor_extras` (los tramos extra/dominical). Mover horas de ordinaria a
+  extra sube el neto — efecto buscado. La parte ordinaria la cubre `base/2`.
+- Validado con simulación de la config real: Maye 7–16 = 9h ord / $0 extra (antes
+  el umbral de 7h le cobraba 2h extra de más — el bug que se vio).
+
+**Implicaciones en producción (por qué es seguro):**
+- **Cero migración, cero cambio de esquema.** Los turnos ya guardados conservan sus
+  valores; solo los turnos nuevos (o los re-clasificados) usan la regla nueva.
+- **Arreglar un turno viejo mal clasificado:** "corregir turno de X del [fecha]"
+  re-corre el motor nuevo y hace UPDATE en sitio. Con la quincena abierta, el
+  resumen se actualiza al instante (sin conflicto de snapshot).
+- Reversible con `git revert`; es cambio de funciones puras testeadas, no toca DB ni
+  el proceso del bot.
+
+**Pendiente:** desplegar (push + sincronizar upstream en Railway + redeploy). Si a
+futuro los horarios cambian seguido, evaluar moverlos a una tabla versionada.
