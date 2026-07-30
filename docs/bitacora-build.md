@@ -879,3 +879,54 @@ ventana) = extra. Domingo/festivo sigue mandando: todo dominical (100%).
 
 **Pendiente:** desplegar (push + sincronizar upstream en Railway + redeploy). Si a
 futuro los horarios cambian seguido, evaluar moverlos a una tabla versionada.
+
+## Sesión 13 — Préstamos/bonos en cuotas, crear/eliminar turnos, respaldo automático la víspera
+
+Tres correcciones nuevas. **Ninguna necesitó migración** (reutilizan tablas/estados
+existentes) → deploy = solo `railway up`.
+
+**1. Préstamos/bonos en cuotas (sección 9.3).**
+- Core puro en `quincena.ts` (+tests): `iniciosProximasQuincenas` (fechas de inicio de
+  N quincenas consecutivas, con salto de mes/año por aritmética de fechas),
+  `dividirEnCuotas` (reparto exacto, sobrante a las primeras), `etiquetaPeriodoQuincena`.
+- Flujo: tras "le presté 240 a Nena", el bot pregunta cuotas (botones 1–6, handler
+  `cuota:N:id`), calcula el plan (una quincena por cuota, `ensureQuincenaVigente`
+  crea las futuras), muestra la vista previa desglosada y al confirmar crea **una fila
+  de `movimientos` por cuota** (nota "cuota k/N"). Cada cuota pesa solo en su quincena.
+- `MovimientoPendiente` pasó a guardar un `plan[]` en vez de una sola quincena;
+  `msgConfirmarMovimiento`/`msgMovimientoRegistrado` muestran el desglose.
+
+**2. Crear / eliminar turnos desde admin (sección 18.3).**
+- Intents nuevos en `comandosAdmin` (+tests): `crear-turno`, `eliminar-turno`
+  (verificado que "borrar turno" NO colisiona con "borrar base de datos").
+- **Crear:** "crear turno de Nena del 28 de julio" → pide rango → vista previa →
+  confirmar. Crea 2 eventos confirmados + `materializarTurno` (reusa el motor de
+  ventanas y la regla de no-solape/máx-2). Nuevo `kind: 'turno-nuevo'` en la propuesta
+  y `crear-turno-horario` en `AdminAwaiting`.
+- **Eliminar:** "eliminar turno de Nena del 28 de julio" → elegir si hay varios →
+  confirmar. `eliminarTurno` (servicio) + `eliminarTurnoYRechazarEventos` (queries):
+  borra la fila de `turnos` (derivada) y marca sus 2 eventos `rechazado` para que la
+  entrada no reaparezca como bloque abierto. Handlers `et:pick/et:confirm/et:cancel`
+  (llevan el turnoId en el callback → a prueba de reinicio). Quincena cerrada: se borra
+  el turno pero el snapshot congelado no cambia (avisa).
+
+**3. Respaldo automático la víspera del cierre (sección 12.1).**
+- `esVisperaDeCorte(fecha)` en core (+tests): true si MAÑANA es corte (funciona en
+  meses de 30/31/28-29 por construcción).
+- `scheduler.ts` gana un 2º cron a las **23:30 Bogotá** con callback `onVispera`; en
+  index se cablea a `enviarRespaldoVispera` → aviso + `enviarReportes(..., 'ambos')`
+  (Excel+PDF parciales). No cierra ni congela nada.
+
+**Decisiones / notas:**
+- Cuotas por **botones** (1–6), no por texto (menos fricción, menos estado en memoria).
+- Eliminar turno marca los eventos `rechazado` (transición de estado, consistente con
+  el ciclo existente); el log inmutable se conserva. Limitación conocida anotada (si el
+  evento era corrección de otro, el anterior podría reaparecer como bloque abierto).
+- Validado con simulación real: $240.000 en 2 cuotas → $120.000 Q2-Julio + $120.000
+  Q1-Agosto. **76 core tests en verde, typecheck limpio.**
+
+**Docs:** Guía en chat (`msgGuiaAdmin`), documento técnico (§9.3, §12.1, §18.3) y esta
+bitácora actualizados.
+
+**Pendiente:** desplegar con `railway up` (sin migración) y verificar en Telegram:
+una cuota real, crear y eliminar un turno, y —cuando toque— el respaldo de víspera.

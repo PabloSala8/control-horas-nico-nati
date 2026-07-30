@@ -34,6 +34,8 @@ export type ComandoAdmin =
   | { tipo: 'rates-ver' }
   | { tipo: 'rates-cambiar'; cambio: CambioRate }
   | { tipo: 'corregir-turno'; alias: string | null; fecha: string | null }
+  | { tipo: 'crear-turno'; alias: string | null; fecha: string | null }
+  | { tipo: 'eliminar-turno'; alias: string | null; fecha: string | null }
   | { tipo: 'reset-db' }
   | { tipo: 'guia' }
   | { tipo: 'incompleto'; intento: 'prestamo' | 'bono'; faltaMonto: boolean; faltaEmpleada: boolean }
@@ -231,6 +233,16 @@ export function interpretarComandoAdmin(
   // Corregir un turno pasado (sección 18): "corregir turno de Nena del 20 de julio".
   if (/\bcorregir\b|\bcorrige\b|\bcorreccion\b/.test(t) && /\bturno\b/.test(t)) {
     return { tipo: 'corregir-turno', alias, fecha: parseFechaEspanol(t, añoActual) };
+  }
+
+  // Crear un turno manual (admin): "crear turno de Nena del 28 de julio".
+  if (/\bcrear\b|\bcrea\b|\bagregar\b|\banadir\b|\banade\b|\bnuevo\b|\bregistra(?:r)?\b/.test(t) && /\bturno\b/.test(t)) {
+    return { tipo: 'crear-turno', alias, fecha: parseFechaEspanol(t, añoActual) };
+  }
+
+  // Eliminar un turno (admin): "eliminar turno de Nena del 28 de julio".
+  if (/\beliminar\b|\belimina\b|\bborrar\b|\bborra\b|\bquitar\b|\bquita\b/.test(t) && /\bturno\b/.test(t)) {
+    return { tipo: 'eliminar-turno', alias, fecha: parseFechaEspanol(t, añoActual) };
   }
 
   // Rates (sección 17): cambiar primero (verbo + campo + valor), luego consultar.

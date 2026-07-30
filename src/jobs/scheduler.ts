@@ -8,10 +8,18 @@
  */
 import cron from 'node-cron';
 import { ahoraBogota, fechaISO } from '../core/tiempo.ts';
-import { esFechaDeCorte } from '../core/quincena.ts';
+import { esFechaDeCorte, esVisperaDeCorte } from '../core/quincena.ts';
 import { ensureQuincenaVigente } from '../db/queries.ts';
 
-export function iniciarScheduler(onCorte: (quincenaId: string) => Promise<void>): void {
+/**
+ * @param onCorte   se llama a las 23:00 de un día de corte (día 15 o último del mes).
+ * @param onVispera se llama a las 23:30 de la VÍSPERA de un corte (respaldo del
+ *   Excel/PDF antes de que cierre la quincena, sección 12.1).
+ */
+export function iniciarScheduler(
+  onCorte: (quincenaId: string) => Promise<void>,
+  onVispera: (quincenaId: string) => Promise<void>,
+): void {
   cron.schedule(
     '0 23 * * *',
     async () => {
@@ -26,5 +34,21 @@ export function iniciarScheduler(onCorte: (quincenaId: string) => Promise<void>)
     },
     { timezone: 'America/Bogota' },
   );
-  console.log('⏰ Scheduler de cierre activo (días 15 y último de cada mes, 23:00 Bogotá).');
+
+  cron.schedule(
+    '30 23 * * *',
+    async () => {
+      try {
+        const hoy = ahoraBogota();
+        if (!esVisperaDeCorte(hoy)) return;
+        const quincenaId = await ensureQuincenaVigente(fechaISO(hoy));
+        await onVispera(quincenaId);
+      } catch (err) {
+        console.error('Error en el job de respaldo de víspera:', err);
+      }
+    },
+    { timezone: 'America/Bogota' },
+  );
+
+  console.log('⏰ Scheduler activo (cierre 23:00 en corte; respaldo 23:30 en la víspera, hora Bogotá).');
 }

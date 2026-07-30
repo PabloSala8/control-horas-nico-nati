@@ -437,15 +437,31 @@ igual.
 
 ## 9. Flujo: préstamos
 
-1. Solo desde el grupo de admins: *"le presté 200 a Nena"*.
-2. El bot confirma monto, empleada y a qué quincena se descuenta (por
-   defecto la quincena vigente, ajustable).
-3. Se crea un `movimiento` tipo `prestamo`. Resta del neto de esa quincena.
+1. Solo desde el grupo de admins: *"le presté 240 a Nena"*.
+2. El bot pregunta **en cuántas quincenas se divide** (ver 9.3) y confirma monto,
+   empleada y el desglose por quincena.
+3. Se crea un `movimiento` tipo `prestamo` **por cada cuota** (uno por quincena).
+   Cada uno resta del neto de SU quincena.
+
+### 9.3 Préstamos/bonos en cuotas (varias quincenas)
+
+Un préstamo/bono se puede dividir en varias quincenas. Tras el monto, el bot
+pregunta el número de cuotas (botones 1–6); **cuota 1 = quincena actual, cuota 2 =
+la siguiente**, y así. El monto se reparte parejo (el sobrante en pesos va a las
+primeras cuotas para que la suma sea exacta). Ejemplo: préstamo de $240.000 en 2
+cuotas → $120.000 en Q2-Julio + $120.000 en Q1-Agosto.
+
+- Se crea **una fila de `movimientos` por cuota**, cada una atada a su quincena (la
+  nota lleva "cuota k/N"). Así cada cuota aparece solo en el resumen de su quincena.
+- Las quincenas futuras se **crean por adelantado** con `ensureQuincenaVigente`
+  (idempotente) — no se toca el esquema. El cómputo de la quincena siguiente usa
+  aritmética de fechas, correcto en meses de 30/31/28-29 días y en el salto de año.
 
 ## 10. Flujo: bonos
 
-Mismo mecanismo que préstamos pero tipo `bono`, suma en vez de restar, y su
-catálogo de motivos es configurable por los admins igual que las actividades.
+Mismo mecanismo que préstamos pero tipo `bono`, suma en vez de restar. También se
+puede dividir en cuotas (sección 9.3). Su catálogo de motivos es configurable por
+los admins igual que las actividades.
 
 ## 11. Consulta en vivo
 
@@ -468,6 +484,15 @@ de cada mes) o manualmente por un admin.
    se recalcula después, aunque cambien rates o salarios a futuro.
 4. Genera y envía automáticamente al grupo de admins el Excel de tracking y
    el PDF resumen, marcados como versión cerrada/definitiva.
+
+### 12.1 Respaldo automático la víspera del cierre
+
+Un segundo job programado corre a las **23:30 hora Bogotá**. Si MAÑANA es día de
+corte (es decir, hoy es la víspera: día 14, o el penúltimo del mes), envía al grupo
+de admins el Excel y el PDF **parciales** de la quincena vigente, como respaldo —
+por si se les olvida sacarlos antes de que cierre. La "víspera" se evalúa
+preguntando si mañana es corte (`esVisperaDeCorte`), así funciona en meses de
+30/31/28-29 días sin casos especiales. No cierra ni congela nada; es solo el envío.
 
 ## 13. Excel y PDF bajo demanda
 
@@ -582,6 +607,25 @@ confirmado y cerrado**, de cualquier fecha pasada.
 
 Misma regla que en la sección 17: quien lo pide y lo confirma es la misma
 persona, sin segunda aprobación.
+
+### 18.3 Crear y eliminar turnos (admins)
+
+Además de corregir, un admin puede **crear** un turno para un día que no se marcó
+(se les olvidó iniciarlo) o **eliminar** uno.
+
+- **Crear:** *"crear turno de Nena del 28 de julio"* → el bot pide el rango
+  (*"de 7:00 am a 4:00 pm"*) → vista previa (mismo formato de 7.4) → **Sí/Cancelar**.
+  Al confirmar crea dos `eventos_marcacion` confirmados (entrada y salida) y
+  materializa el turno con el motor (clasifica ordinaria/extra con la ventana de la
+  empleada, y respeta la regla de no-solape/máx-2 turnos por día).
+- **Eliminar:** *"eliminar turno de Nena del 28 de julio"* → si hay varios ese día,
+  se elige cuál → **confirmar**. Se borra la fila de `turnos` (dato derivado) y sus
+  dos eventos quedan en estado `rechazado`, para que la entrada no reaparezca como
+  bloque abierto. El log de eventos NO se borra (se conserva la trazabilidad).
+- Si el turno pertenece a una quincena **cerrada**, crear/eliminar NO cambia el
+  snapshot congelado (mismo principio que corregir, 18.2).
+- Limitación conocida: si los eventos del turno eliminado eran correcciones de otros
+  eventos, el evento anterior podría reaparecer como bloque abierto (caso raro).
 
 ## 19. Orden de construcción — Sesión 5 (correcciones post-demo)
 

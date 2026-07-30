@@ -130,9 +130,10 @@ export function msgGuiaAdmin(): string {
     `*Aprobaciones*`,
     `• Cuando una empleada corrige o cierra un turno, te llega aquí con *Sí* / *No, cambiar*.`,
     ``,
-    `*Préstamos y bonos*`,
-    `• «le presté 200 a Nena»`,
-    `• «bono de 50 a Maye por navidad»`,
+    `*Préstamos y bonos (en cuotas)*`,
+    `• «le presté 240 a Nena» · «bono de 50 a Maye por navidad»`,
+    `• Después te pregunto *en cuántas quincenas* se divide (botones 1–6). Ej: 240 en`,
+    `  2 → $120 esta quincena y $120 la siguiente. 1 = solo la quincena actual.`,
     ``,
     `*Consulta en vivo*`,
     `• «cómo va la quincena» — resumen al instante (sin archivo).`,
@@ -142,11 +143,15 @@ export function msgGuiaAdmin(): string {
     `• «cambiar salario base a 1.800.000» · «recargo dominical a 100%» · «inicio nocturno a 9pm»`,
     ``,
     `*Turnos*`,
-    `• «corregir turno de Nena del 20 de julio»`,
+    `• «corregir turno de Nena del 20 de julio» — cambia el horario de un turno.`,
+    `• «crear turno de Nena del 28 de julio» — para un día que se les olvidó marcar;`,
+    `  luego escribes el rango (ej: «de 7:00 am a 4:00 pm»).`,
+    `• «eliminar turno de Nena del 28 de julio» — borra un turno; te pido confirmar.`,
     ``,
     `*Cierre y reportes*`,
     `• «cerrar quincena» — congela y genera Excel/PDF.`,
     `• «dame el excel» · «dame el pdf» · «reporte»`,
+    `• 📩 La *víspera del cierre* (11:30 PM) te llegan Excel y PDF automáticamente, de respaldo.`,
     ``,
     `*Desarrollo*`,
     `• «borrar base de datos» — reinicia todo a cero (con confirmación).`,
@@ -350,35 +355,52 @@ export function msgActividadRegistrada(nombre: string): string {
 
 const etiquetaMov = (t: MovimientoTipo) => (t === 'prestamo' ? 'Préstamo' : 'Bono');
 
+/** Pregunta en cuántas quincenas se divide un préstamo/bono (sección 9.3). */
+export function msgPreguntarCuotas(params: { tipo: MovimientoTipo; alias: string; monto: number }): string {
+  const { tipo, alias, monto } = params;
+  const verbo = tipo === 'prestamo' ? 'se descuenta' : 'se paga';
+  return [
+    `🧾 *${etiquetaMov(tipo)}* de *${formatoPesos(monto)}* para *${alias}*.`,
+    `¿En cuántas quincenas ${verbo}? (1 = solo esta quincena)`,
+  ].join('\n');
+}
+
 export function msgConfirmarMovimiento(params: {
   tipo: MovimientoTipo;
   alias: string;
-  monto: number;
-  periodo: string;
+  montoTotal: number;
   nota?: string;
+  plan: Array<{ periodo: string; monto: number }>;
 }): string {
-  const { tipo, alias, monto, periodo, nota } = params;
+  const { tipo, alias, montoTotal, nota, plan } = params;
   const efecto = tipo === 'prestamo' ? 'se descuenta de' : 'se suma a';
-  return [
+  const lineas: Array<string | undefined> = [
     `🧾 *${etiquetaMov(tipo)}* — voy a registrar:`,
-    `${etiquetaMov(tipo)} de *${formatoPesos(monto)}* para *${alias}*`,
+    `${etiquetaMov(tipo)} de *${formatoPesos(montoTotal)}* para *${alias}*`,
     nota ? `Motivo: ${nota}` : undefined,
-    `${efecto} la quincena *${periodo}*.`,
-    ``,
-    `¿Confirmo?`,
-  ]
-    .filter((l) => l !== undefined)
-    .join('\n');
+  ];
+  if (plan.length === 1) {
+    lineas.push(`${efecto} la quincena *${plan[0].periodo}*.`);
+  } else {
+    lineas.push(`En *${plan.length} cuotas*:`);
+    for (const c of plan) lineas.push(`  • ${c.periodo}: *${formatoPesos(c.monto)}*`);
+  }
+  lineas.push(``, `¿Confirmo?`);
+  return lineas.filter((l) => l !== undefined).join('\n');
 }
 
 export function msgMovimientoRegistrado(params: {
   tipo: MovimientoTipo;
   alias: string;
-  monto: number;
-  periodo: string;
+  montoTotal: number;
+  plan: Array<{ periodo: string; monto: number }>;
 }): string {
-  const { tipo, alias, monto, periodo } = params;
-  return `✅ ${etiquetaMov(tipo)} de *${formatoPesos(monto)}* registrado para *${alias}* en ${periodo}.`;
+  const { tipo, alias, montoTotal, plan } = params;
+  if (plan.length === 1) {
+    return `✅ ${etiquetaMov(tipo)} de *${formatoPesos(montoTotal)}* registrado para *${alias}* en ${plan[0].periodo}.`;
+  }
+  const detalle = plan.map((c) => `  • ${c.periodo}: ${formatoPesos(c.monto)}`).join('\n');
+  return `✅ ${etiquetaMov(tipo)} de *${formatoPesos(montoTotal)}* registrado para *${alias}* en ${plan.length} cuotas:\n${detalle}`;
 }
 
 export function msgMovimientoCancelado(): string {
@@ -585,6 +607,85 @@ export function msgTurnoCorregido(params: {
     );
   }
   return lineas.join('\n');
+}
+
+// ---------- Crear / eliminar turno manual (admin, sección 18.3) ----------
+
+export function msgPedirRangoCrearTurno(alias: string, fechaFmt: string): string {
+  return [
+    `➕ Crear turno — *${alias}* · ${fechaFmt}`,
+    `Escribe el horario del turno (un rango, ej: \`de 7:00 am a 4:00 pm\`).`,
+  ].join('\n');
+}
+
+export function msgTurnoCreado(params: {
+  alias: string;
+  fechaFmt: string;
+  entrada: Date;
+  salida: Date;
+  r: ResultadoClasificacion;
+}): string {
+  return [
+    `✅ Turno creado — *${params.alias}* (${params.fechaFmt})`,
+    `${formatoHora12(params.entrada)} – ${formatoHora12(params.salida)} (${formatoDuracion(params.r.horasTotales)})`,
+    bloqueValorAdmin(params.r.valorCalculado, []),
+  ].join('\n');
+}
+
+export function msgConfirmarEliminarTurno(params: {
+  alias: string;
+  fechaFmt: string;
+  entrada: Date;
+  salida: Date;
+  horas: number;
+}): string {
+  return [
+    `🗑️ ¿Eliminar este turno de *${params.alias}* (${params.fechaFmt})?`,
+    `${formatoHora12(params.entrada)} – ${formatoHora12(params.salida)} (${formatoDuracion(params.horas)})`,
+    ``,
+    `Esto borra el turno; las marcaciones quedan anuladas. ¿Confirmas?`,
+  ].join('\n');
+}
+
+export function msgVariosTurnosParaEliminar(alias: string, fechaFmt: string, lineas: string[]): string {
+  return [
+    `🗑️ Eliminar turno — *${alias}* · ${fechaFmt}`,
+    `Hay ${lineas.length} turnos ese día. ¿Cuál eliminas?`,
+    ...lineas.map((l, i) => `${i + 1}) ${l}`),
+  ].join('\n');
+}
+
+export function msgTurnoEliminado(params: {
+  alias: string;
+  fechaFmt: string;
+  entrada: Date;
+  salida: Date;
+  quincenaCerrada: boolean;
+}): string {
+  const lineas = [
+    `🗑️ Turno de *${params.alias}* (${params.fechaFmt}) eliminado:`,
+    `${formatoHora12(params.entrada)} – ${formatoHora12(params.salida)}`,
+  ];
+  if (params.quincenaCerrada) {
+    lineas.push(
+      ``,
+      `(!) Esa quincena ya está *cerrada*: el turno se eliminó pero el neto congelado NO cambia. Si hay que ajustar lo pagado, es aparte.`,
+    );
+  }
+  return lineas.join('\n');
+}
+
+export function msgTurnoEliminarCancelado(): string {
+  return `Cancelado. No eliminé nada.`;
+}
+
+// ---------- Respaldo automático la víspera del cierre (sección 12.1) ----------
+
+export function msgRespaldoVispera(periodo: string): string {
+  return [
+    `📩 *Respaldo automático* — mañana cierra la quincena *${periodo}*.`,
+    `Te envío el Excel y el PDF preliminares por si acaso, para que no pierdas la info.`,
+  ].join('\n');
 }
 
 // ---------- Borrar base de datos (solo desarrollo) — grupo admin ----------

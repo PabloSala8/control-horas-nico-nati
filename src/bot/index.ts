@@ -61,12 +61,14 @@ import {
   procesarEventoConfirmado,
   materializarTurno,
   turnoEnConflicto,
+  eliminarTurno,
   resumenParaReporte,
   turnosParaReporte,
   turnosPorEmpleadaParaReporte,
   type ConflictoTurno,
   type ResultadoMaterializacion,
 } from './servicio.ts';
+import { dividirEnCuotas, iniciosProximasQuincenas, etiquetaPeriodoQuincena } from '../core/quincena.ts';
 import { prepararCierre, confirmarCierre } from '../jobs/cierre.ts';
 import { iniciarScheduler } from '../jobs/scheduler.ts';
 import { generarExcel } from '../reports/excel.ts';
@@ -99,7 +101,7 @@ interface SolicitudTipo {
 /** Propuesta de turno pendiente de confirmar en la vista previa 7.4. */
 interface PropuestaTurno {
   id: string;
-  kind: 'correccion-salida' | 'turno-pasado';
+  kind: 'correccion-salida' | 'turno-pasado' | 'turno-nuevo';
   empleadaId: string;
   empleadaChatId: number;
   alias: string;
@@ -125,8 +127,8 @@ interface MovimientoPendiente {
   alias: string;
   monto: number;
   nota?: string;
-  quincenaId: string;
-  periodo: string;
+  /** Se llena al elegir cuotas: una entrada por quincena en la que se descuenta/paga. */
+  plan?: Array<{ quincenaId: string; periodo: string; monto: number }>;
 }
 interface RatePendiente {
   id: string;
@@ -146,7 +148,8 @@ type AdminAwaiting =
       alias: string;
       fecha: string;
     }
-  | { kind: 'corregir-turno-horario'; turno: TurnoConEventos };
+  | { kind: 'corregir-turno-horario'; turno: TurnoConEventos }
+  | { kind: 'crear-turno-horario'; empleadaId: string; alias: string; fecha: string };
 
 const solicitudesFallback = new Map<string, SolicitudFallback>();
 const solicitudesTipo = new Map<string, SolicitudTipo>();
@@ -191,6 +194,14 @@ const tecladoMovimiento = (id: string) =>
     [Markup.button.callback('✅ Confirmar', `mov:confirm:${id}`), Markup.button.callback('❌ Cancelar', `mov:cancel:${id}`)],
   ]);
 
+/** Elegir en cuántas quincenas se divide un préstamo/bono (sección 9.3). */
+const tecladoCuotas = (id: string) =>
+  Markup.inlineKeyboard([
+    [1, 2, 3].map((n) => Markup.button.callback(String(n), `cuota:${n}:${id}`)),
+    [4, 5, 6].map((n) => Markup.button.callback(String(n), `cuota:${n}:${id}`)),
+    [Markup.button.callback('❌ Cancelar', `mov:cancel:${id}`)],
+  ]);
+
 /** Vista previa de una corrección interpretada: Sí / No, cambiar (sección 7.4). */
 const tecladoAprobacion = (eventoId: string) =>
   Markup.inlineKeyboard([
@@ -226,6 +237,16 @@ const tecladoRate = (id: string) =>
 
 const tecladoPickTurno = (turnos: TurnoConEventos[]) =>
   Markup.inlineKeyboard(turnos.map((t, i) => [Markup.button.callback(`✏️ Turno ${i + 1}`, `ct:pick:${t.id}`)]));
+
+/** Elegir cuál turno eliminar cuando hay varios ese día (sección 18.3). */
+const tecladoPickEliminar = (turnos: TurnoConEventos[]) =>
+  Markup.inlineKeyboard(turnos.map((t, i) => [Markup.button.callback(`🗑️ Turno ${i + 1}`, `et:pick:${t.id}`)]));
+
+/** Confirmar la eliminación de un turno concreto. */
+const tecladoEliminarConfirm = (turnoId: string) =>
+  Markup.inlineKeyboard([
+    [Markup.button.callback('🗑️ Sí, eliminar', `et:confirm:${turnoId}`), Markup.button.callback('❌ Cancelar', 'et:cancel')],
+  ]);
 
 /** Botón "Corregir" en el aviso de turno cerrado -> entra al flujo de §18. */
 const tecladoCorregirTurno = (turnoId: string) =>
@@ -976,6 +997,51 @@ async function manejarAwaitingAdmin(texto: string): Promise<void> {
     );
     return;
   }
+
+  if (st.kind === 'crear-turno-horario') {
+    const [y, m, d] = st.fecha.split('-').map((n) => parseInt(n, 10));
+    const base = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
+    let entrada: Date;
+    let salida: Date;
+    if (interp.rango) {
+      entrada = conHoraDelDia(base, interp.rango.entrada.hora, interp.rango.entrada.minuto);
+      salida = conHoraDelDia(base, interp.rango.salida.hora, interp.rango.salida.minuto);
+    } else {
+      return enviarAdmins('Para crear un turno necesito el rango completo, ej: `de 7:00 am a 4:00 pm`.');
+    }
+    let resultado: ResultadoClasificacion;
+    let ratesId: string;
+    try {
+      ({ resultado, ratesId } = await clasificarPar(entrada, salida, st.alias));
+    } catch {
+      return enviarAdmins('Ese horario no es válido: la salida debe ser después de la entrada.');
+    }
+    const conflicto = await turnoEnConflicto(st.empleadaId, entrada, salida);
+    if (conflicto) {
+      awaitingAdmin.delete(config.adminChatId);
+      return avisarConflictoAdmins(st.alias, entrada, salida, conflicto);
+    }
+    const prop: PropuestaTurno = {
+      id: randomUUID(),
+      kind: 'turno-nuevo',
+      empleadaId: st.empleadaId,
+      empleadaChatId: 0,
+      alias: st.alias,
+      fecha: st.fecha,
+      entrada,
+      salida,
+      r: resultado,
+      ratesId,
+      momentoMensaje: timestampSQL(ahoraBogota()),
+    };
+    propuestas.set(prop.id, prop);
+    awaitingAdmin.delete(config.adminChatId);
+    await enviarAdmins(
+      F.msgConfirmacionTurno({ alias: st.alias, entrada, salida, r: resultado, encabezado: 'Turno nuevo' }),
+      tecladoPropuestaTurno(prop.id),
+    );
+    return;
+  }
 }
 
 // ---------- Propuestas de turno: confirmar / recambiar / cancelar ----------
@@ -987,6 +1053,46 @@ bot.action(/^prop:confirm:(.+)$/, async (ctx) => {
     if (!prop) return ctx.answerCbQuery('Esa propuesta ya no está disponible.');
     const admin = await getAdminPorChat(config.adminChatId);
     propuestas.delete(prop.id);
+
+    if (prop.kind === 'turno-nuevo') {
+      // Crear turno manual (sección 18.3): dos eventos confirmados + materializar.
+      const conflicto = await turnoEnConflicto(prop.empleadaId, prop.entrada, prop.salida);
+      if (conflicto) {
+        await avisarConflictoAdmins(prop.alias, prop.entrada, prop.salida, conflicto);
+        return ctx.answerCbQuery('No se creó: se cruza con otro turno');
+      }
+      const entradaEvento = await crearEvento({
+        empleadaId: prop.empleadaId,
+        tipo: 'entrada',
+        momentoDeclarado: timestampSQL(prop.entrada),
+        momentoMensaje: prop.momentoMensaje,
+        estado: 'confirmado',
+        aprobadoPor: admin!.id,
+      });
+      const salidaEvento = await crearEvento({
+        empleadaId: prop.empleadaId,
+        tipo: 'salida',
+        momentoDeclarado: timestampSQL(prop.salida),
+        momentoMensaje: prop.momentoMensaje,
+        estado: 'confirmado',
+        aprobadoPor: admin!.id,
+      });
+      const mat = await materializarTurno(prop.empleadaId, entradaEvento, salidaEvento);
+      if (!mat.ok) {
+        await avisarConflictoAdmins(prop.alias, prop.entrada, prop.salida, mat.conflicto);
+        return ctx.answerCbQuery('No se creó: se cruza con otro turno');
+      }
+      await enviarAdmins(
+        F.msgTurnoCreado({
+          alias: prop.alias,
+          fechaFmt: formatoFechaDMYDesde(prop.fecha),
+          entrada: prop.entrada,
+          salida: prop.salida,
+          r: mat.resultado!,
+        }),
+      );
+      return ctx.answerCbQuery('Turno creado ✅');
+    }
 
     if (prop.kind === 'correccion-salida') {
       // Guard §6: re-validar por si entró otro turno entre la vista previa y ahora
@@ -1196,9 +1302,6 @@ async function manejarComandoAdmin(
     case 'bono': {
       const empleada = empleadas.find((e) => e.alias === cmd.alias);
       if (!empleada) return;
-      const quincenaId = await ensureQuincenaHoy();
-      const quincena = await getQuincenaById(quincenaId);
-      const periodo = quincena?.periodo ?? '—';
       const id = randomUUID();
       movimientosPendientes.set(id, {
         tipo: cmd.tipo,
@@ -1206,13 +1309,19 @@ async function manejarComandoAdmin(
         alias: empleada.alias,
         monto: cmd.monto,
         nota: cmd.nota,
-        quincenaId,
-        periodo,
       });
       await enviarAdmins(
-        F.msgConfirmarMovimiento({ tipo: cmd.tipo, alias: empleada.alias, monto: cmd.monto, periodo, nota: cmd.nota }),
-        tecladoMovimiento(id),
+        F.msgPreguntarCuotas({ tipo: cmd.tipo, alias: empleada.alias, monto: cmd.monto }),
+        tecladoCuotas(id),
       );
+      return;
+    }
+    case 'crear-turno': {
+      await iniciarCreacionTurno(cmd.alias, cmd.fecha, empleadas);
+      return;
+    }
+    case 'eliminar-turno': {
+      await iniciarEliminacionTurno(cmd.alias, cmd.fecha, empleadas);
       return;
     }
     case 'incompleto': {
@@ -1271,25 +1380,156 @@ async function iniciarCorreccionTurno(
   await enviarAdmins(F.msgVariosTurnosParaCorregir(empleada.alias, fechaFmt, turnos.map(lineaDeTurno)), tecladoPickTurno(turnos));
 }
 
+/** Arranca el flujo de CREAR un turno manual para un día pasado (sección 18.3). */
+async function iniciarCreacionTurno(alias: string | null, fecha: string | null, empleadas: Empleada[]): Promise<void> {
+  if (!alias || !fecha) {
+    await enviarAdmins('Escríbelo así: `crear turno de Nena del 28 de julio`.');
+    return;
+  }
+  const empleada = empleadas.find((e) => e.alias.toLowerCase() === alias.toLowerCase());
+  if (!empleada) {
+    await enviarAdmins(`No reconozco a «${escMd(alias)}».`);
+    return;
+  }
+  awaitingAdmin.set(config.adminChatId, { kind: 'crear-turno-horario', empleadaId: empleada.id, alias: empleada.alias, fecha });
+  await enviarAdmins(F.msgPedirRangoCrearTurno(empleada.alias, formatoFechaDMYDesde(fecha)));
+}
+
+/** Arranca el flujo de ELIMINAR un turno (sección 18.3). */
+async function iniciarEliminacionTurno(alias: string | null, fecha: string | null, empleadas: Empleada[]): Promise<void> {
+  if (!alias || !fecha) {
+    await enviarAdmins('Escríbelo así: `eliminar turno de Nena del 28 de julio`.');
+    return;
+  }
+  const empleada = empleadas.find((e) => e.alias.toLowerCase() === alias.toLowerCase());
+  if (!empleada) {
+    await enviarAdmins(`No reconozco a «${escMd(alias)}».`);
+    return;
+  }
+  const turnos = await getTurnosDeEmpleadaEnFecha(empleada.id, fecha);
+  const fechaFmt = formatoFechaDMYDesde(fecha);
+  if (turnos.length === 0) {
+    await enviarAdmins(F.msgTurnoNoEncontrado(empleada.alias, fechaFmt));
+    return;
+  }
+  if (turnos.length === 1) {
+    const t = turnos[0];
+    await enviarAdmins(
+      F.msgConfirmarEliminarTurno({
+        alias: empleada.alias,
+        fechaFmt,
+        entrada: parseSQLaDate(t.entrada_declarado),
+        salida: parseSQLaDate(t.salida_declarado),
+        horas: Number(t.horas_totales),
+      }),
+      tecladoEliminarConfirm(t.id),
+    );
+    return;
+  }
+  await enviarAdmins(F.msgVariosTurnosParaEliminar(empleada.alias, fechaFmt, turnos.map(lineaDeTurno)), tecladoPickEliminar(turnos));
+}
+
+// ---------- Eliminar turno: elegir / confirmar / cancelar (sección 18.3) ----------
+bot.action(/^et:pick:(.+)$/, async (ctx) => {
+  if (!(await esChatAdmin(ctx.chat?.id))) return ctx.answerCbQuery();
+  const turno = await getTurnoConEventosById(ctx.match[1]);
+  await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+  if (!turno) return ctx.answerCbQuery('Ese turno ya no está disponible.');
+  await enviarAdmins(
+    F.msgConfirmarEliminarTurno({
+      alias: turno.alias,
+      fechaFmt: formatoFechaDMYDesde(turno.fecha),
+      entrada: parseSQLaDate(turno.entrada_declarado),
+      salida: parseSQLaDate(turno.salida_declarado),
+      horas: Number(turno.horas_totales),
+    }),
+    tecladoEliminarConfirm(turno.id),
+  );
+  return ctx.answerCbQuery();
+});
+
+bot.action(/^et:confirm:(.+)$/, async (ctx) => {
+  try {
+    if (!(await esChatAdmin(ctx.chat?.id))) return ctx.answerCbQuery();
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+    const res = await eliminarTurno(ctx.match[1]);
+    if (!res) return ctx.answerCbQuery('Ese turno ya no existe.');
+    await enviarAdmins(
+      F.msgTurnoEliminado({
+        alias: res.alias,
+        fechaFmt: formatoFechaDMYDesde(res.fecha),
+        entrada: res.entrada,
+        salida: res.salida,
+        quincenaCerrada: res.quincenaCerrada,
+      }),
+    );
+    return ctx.answerCbQuery('Turno eliminado 🗑️');
+  } catch (err) {
+    console.error('Error en et:confirm', err);
+    return ctx.answerCbQuery('Ups, algo falló.');
+  }
+});
+
+bot.action('et:cancel', async (ctx) => {
+  if (!(await esChatAdmin(ctx.chat?.id))) return ctx.answerCbQuery();
+  await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+  await enviarAdmins(F.msgTurnoEliminarCancelado());
+  return ctx.answerCbQuery('Cancelado');
+});
+
+// ---------- Elegir cuotas (quincenas) del préstamo/bono (sección 9.3) ----------
+bot.action(/^cuota:(\d+):(.+)$/, async (ctx) => {
+  try {
+    if (!(await esChatAdmin(ctx.chat?.id))) return ctx.answerCbQuery();
+    const pend = movimientosPendientes.get(ctx.match[2]);
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+    if (!pend) return ctx.answerCbQuery('Esa solicitud ya no está disponible.');
+    const cuotas = parseInt(ctx.match[1], 10);
+    const montos = dividirEnCuotas(pend.monto, cuotas);
+    const inicios = iniciosProximasQuincenas(ahoraBogota(), cuotas);
+    const plan: Array<{ quincenaId: string; periodo: string; monto: number }> = [];
+    for (let i = 0; i < cuotas; i++) {
+      const quincenaId = await ensureQuincenaVigente(fechaISO(inicios[i]));
+      plan.push({ quincenaId, periodo: etiquetaPeriodoQuincena(inicios[i]), monto: montos[i] });
+    }
+    pend.plan = plan;
+    await enviarAdmins(
+      F.msgConfirmarMovimiento({ tipo: pend.tipo, alias: pend.alias, montoTotal: pend.monto, nota: pend.nota, plan }),
+      tecladoMovimiento(ctx.match[2]),
+    );
+    return ctx.answerCbQuery();
+  } catch (err) {
+    console.error('Error en cuota:', err);
+    return ctx.answerCbQuery('Ups, algo falló.');
+  }
+});
+
 // ---------- Confirmar / cancelar un préstamo o bono ----------
 bot.action(/^mov:confirm:(.+)$/, async (ctx) => {
   try {
     if (!(await esChatAdmin(ctx.chat?.id))) return ctx.answerCbQuery();
     const pend = movimientosPendientes.get(ctx.match[1]);
-    if (!pend) return ctx.answerCbQuery('Esa solicitud ya no está disponible.');
+    if (!pend || !pend.plan) return ctx.answerCbQuery('Esa solicitud ya no está disponible.');
     const admin = await getAdminPorChat(config.adminChatId);
-    await crearMovimiento({
-      empleadaId: pend.empleadaId,
-      tipo: pend.tipo,
-      monto: pend.monto,
-      fecha: fechaISO(ahoraBogota()),
-      quincenaId: pend.quincenaId,
-      registradoPor: admin!.id,
-      nota: pend.nota ?? null,
-    });
+    const hoy = fechaISO(ahoraBogota());
+    const total = pend.plan.length;
+    for (let i = 0; i < total; i++) {
+      const cuota = pend.plan[i];
+      const notaCuota =
+        total > 1 ? `${pend.nota ? pend.nota + ' — ' : ''}cuota ${i + 1}/${total}` : pend.nota ?? null;
+      await crearMovimiento({
+        empleadaId: pend.empleadaId,
+        tipo: pend.tipo,
+        monto: cuota.monto,
+        fecha: hoy,
+        quincenaId: cuota.quincenaId,
+        registradoPor: admin!.id,
+        nota: notaCuota,
+      });
+    }
     movimientosPendientes.delete(ctx.match[1]);
     await ctx.editMessageReplyMarkup(undefined).catch(() => {});
-    await enviarAdmins(F.msgMovimientoRegistrado({ tipo: pend.tipo, alias: pend.alias, monto: pend.monto, periodo: pend.periodo }));
+    await enviarAdmins(F.msgMovimientoRegistrado({ tipo: pend.tipo, alias: pend.alias, montoTotal: pend.monto, plan: pend.plan }));
     return ctx.answerCbQuery('Registrado ✅');
   } catch (err) {
     console.error('Error en mov:confirm', err);
@@ -1389,6 +1629,13 @@ async function enviarReportes(quincenaId: string, formato: 'excel' | 'pdf' | 'am
 }
 
 // ---------- Ejecutar el cierre y enviar los reportes definitivos ----------
+/** Respaldo automático la víspera del cierre (sección 12.1): avisa y manda Excel+PDF. */
+async function enviarRespaldoVispera(quincenaId: string): Promise<void> {
+  const q = await getQuincenaById(quincenaId);
+  await enviarAdmins(F.msgRespaldoVispera(q?.periodo ?? '—'));
+  await enviarReportes(quincenaId, 'ambos');
+}
+
 async function ejecutarCierreYenviar(quincenaId: string, opts: { auto: boolean }): Promise<void> {
   const res = await confirmarCierre(quincenaId);
   if (!res.ok && res.motivo === 'bloqueado') {
@@ -1511,7 +1758,10 @@ async function arrancarBotConReintento(): Promise<void> {
 }
 
 void arrancarBotConReintento();
-iniciarScheduler((quincenaId) => ejecutarCierreYenviar(quincenaId, { auto: true }));
+iniciarScheduler(
+  (quincenaId) => ejecutarCierreYenviar(quincenaId, { auto: true }),
+  (quincenaId) => enviarRespaldoVispera(quincenaId),
+);
 console.log('🤖 Bot arrancado (long polling con reintento). Ctrl+C para detener.');
 
 const apagar = (sig: 'SIGINT' | 'SIGTERM') => {

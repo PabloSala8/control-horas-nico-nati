@@ -34,6 +34,8 @@ import {
   getQuincenaById,
   getTurnosConEventosDeQuincena,
   getTurnosDeEmpleadaEnFecha,
+  getTurnoConEventosById,
+  eliminarTurnoYRechazarEventos,
   getActividadesDetalleDeQuincena,
   agregadosTurnos,
   agregadosActividades,
@@ -152,6 +154,27 @@ export async function procesarEventoConfirmado(evento: Evento): Promise<Resultad
   }
   // entrada confirmada: supersede la entrada anterior; el bloque queda abierto.
   return { ok: true, resultado: null, turnoId: null };
+}
+
+/**
+ * Elimina un turno (admin, sección 18.3). Devuelve datos para el mensaje, o null
+ * si el turno ya no existe. Si su quincena está cerrada, `quincenaCerrada` avisa que
+ * el neto congelado no cambia (igual que al corregir).
+ */
+export async function eliminarTurno(
+  turnoId: string,
+): Promise<{ quincenaCerrada: boolean; alias: string; fecha: string; entrada: Date; salida: Date } | null> {
+  const t = await getTurnoConEventosById(turnoId);
+  if (!t) return null;
+  const q = t.quincena_id ? await getQuincenaById(t.quincena_id) : null;
+  await eliminarTurnoYRechazarEventos(turnoId);
+  return {
+    quincenaCerrada: q?.estado === 'cerrada',
+    alias: t.alias,
+    fecha: t.fecha,
+    entrada: parseSQLaDate(t.entrada_declarado),
+    salida: parseSQLaDate(t.salida_declarado),
+  };
 }
 
 // ============================================================================

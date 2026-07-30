@@ -142,6 +142,25 @@ test('interpretarComandoAdmin: corregir turno pasado', () => {
   }
 });
 
+test('crear / eliminar turno', () => {
+  const c = interpretarComandoAdmin('crear turno de Nena del 28 de julio', ALIAS, 2026);
+  assert.equal(c.tipo, 'crear-turno');
+  if (c.tipo === 'crear-turno') {
+    assert.equal(c.alias, 'Nena');
+    assert.equal(c.fecha, '2026-07-28');
+  }
+  assert.equal(interpretarComandoAdmin('agregar turno de Maye del 20/07', ALIAS, 2026).tipo, 'crear-turno');
+  const e = interpretarComandoAdmin('eliminar turno de Nena del 28 de julio', ALIAS, 2026);
+  assert.equal(e.tipo, 'eliminar-turno');
+  if (e.tipo === 'eliminar-turno') assert.equal(e.fecha, '2026-07-28');
+  assert.equal(interpretarComandoAdmin('borrar turno de Maye del 20 de julio', ALIAS, 2026).tipo, 'eliminar-turno');
+});
+
+test('«borrar turno» no colisiona con «borrar base de datos»', () => {
+  assert.equal(interpretarComandoAdmin('borrar base de datos', ALIAS).tipo, 'reset-db');
+  assert.equal(interpretarComandoAdmin('borrar turno de Nena del 20 de julio', ALIAS, 2026).tipo, 'eliminar-turno');
+});
+
 test('rates/corregir no roban préstamos ni bonos', () => {
   assert.equal(interpretarComandoAdmin('le presté 200 a Nena', ALIAS).tipo, 'prestamo');
   assert.equal(interpretarComandoAdmin('bono de 50 a Maye por navidad', ALIAS).tipo, 'bono');

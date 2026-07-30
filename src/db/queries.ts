@@ -413,6 +413,28 @@ export interface TurnoConEventos {
   inicio_nocturno: string; // "HH:MM:SS"
 }
 
+/**
+ * Elimina un turno (dato derivado) y marca sus dos eventos de marcación como
+ * `rechazado`, para que la entrada no reaparezca como "bloque abierto". El log de
+ * eventos se conserva (no se borra) — solo cambian de estado, igual que en las
+ * correcciones. Limitación conocida: si esos eventos eran correcciones de otros,
+ * el evento anterior podría volver a verse como bloque abierto (caso raro).
+ */
+export async function eliminarTurnoYRechazarEventos(turnoId: string): Promise<void> {
+  const r = await query<{ entrada_evento_id: string; salida_evento_id: string }>(
+    `SELECT entrada_evento_id, salida_evento_id FROM turnos WHERE id = $1`,
+    [turnoId],
+  );
+  const row = r.rows[0];
+  await query(`DELETE FROM turnos WHERE id = $1`, [turnoId]);
+  if (row) {
+    await query(`UPDATE eventos_marcacion SET estado = 'rechazado' WHERE id IN ($1, $2)`, [
+      row.entrada_evento_id,
+      row.salida_evento_id,
+    ]);
+  }
+}
+
 const SELECT_TURNO_EVENTOS = `
   SELECT t.id, t.fecha, em.alias, t.empleada_id, t.horas_totales, t.desglose_tramos,
          t.valor_tramos, t.valor_calculado, t.rates_id, t.quincena_id, t.entrada_evento_id, t.salida_evento_id,
